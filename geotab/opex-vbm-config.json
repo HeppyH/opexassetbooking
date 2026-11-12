@@ -1,0 +1,15 @@
+{
+  "name": "OPEX Asset Booking Management",
+  "supportEmail": "REPLACE_WITH_PERSONAL_SUPPORT_EMAIL",
+  "version": "0.1.0",
+  "items": [
+    {
+      "url": "https://heppyh.github.io/opexassetbooking/",
+      "path": "ActivityLink",
+      "menuName": {
+        "en": "OPEX Asset Booking"
+      },
+      "category": "AddIns"
+    }
+  ]
+}
