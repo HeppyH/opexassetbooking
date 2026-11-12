@@ -30,7 +30,7 @@ reactRoot.render(<React.StrictMode><App /></React.StrictMode>);
 // standalone browser preview, but always register the required namespace.
 window.geotab = window.geotab ?? {};
 window.geotab.addin = window.geotab.addin ?? {};
-window.geotab.addin.opexVehicleBooking = () => ({
+window.geotab.addin.OpexAssetBookingLink = () => ({
   initialize: (api, state, callback) => {
     document.documentElement.dataset.opexVbm = "initialized";
     window.dispatchEvent(new CustomEvent("opex-vbm:initialize", { detail: { api, state } }));

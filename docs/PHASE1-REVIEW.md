@@ -12,7 +12,7 @@
 ## Changes made in this review
 
 1. Replaced stale `sasa_inti` tenant references with `opex_trial` in the frontend label, Worker variables, environment example, README, deployment guide and tenant checklist.
-2. Updated the frontend lifecycle registration to create the `geotab.addin.opexVehicleBooking` namespace and implement `initialize`, `focus`, and `blur`.
+2. Updated the frontend lifecycle registration to create the `geotab.addin.OpexAssetBookingLink` namespace and implement `initialize`, `focus`, and `blur`.
 3. Added a lifecycle event bridge so the React app can react to host initialization/focus/blur events.
 4. Kept standalone browser preview supported.
 5. Removed the production fallback to `http://127.0.0.1:8787`; when no API URL is configured, the shell loads without attempting a localhost API request.
@@ -41,7 +41,7 @@
 
 ## Important hosting note
 
-The externally hosted Add-In URL must be publicly reachable over HTTPS and must comply with Geotab's Add-In URL requirements. The proposed host `heppyh.github.io` contains no prohibited dash, `@`, or `#` characters. The final deployed HTML must load the JavaScript bundle that registers `geotab.addin.opexVehicleBooking`.
+The externally hosted Add-In URL must be publicly reachable over HTTPS and must comply with Geotab's Add-In URL requirements. The proposed host `heppyh.github.io` contains no prohibited dash, `@`, or `#` characters. The final deployed HTML must load the JavaScript bundle that registers `geotab.addin.OpexAssetBookingLink`.
 
 ## Registration checklist
 
