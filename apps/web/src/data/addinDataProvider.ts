@@ -18,6 +18,7 @@ import type {
   OpexBookingAudit,
   NotificationType,
 } from "./types";
+import { isValidAddInId } from "../config/addinId";
 
 /*───────────────────── Geotab API type (Add-In context) ─────────────────────*/
 
@@ -28,6 +29,20 @@ type GeotabApi = {
 
 const MAX_DETAILS_CHARS = 10000;
 const DEFAULT_GROUP_ID = "GroupCompanyId";
+
+/*───────────────────── Diagnostic Logging ─────────────────────*/
+/* Safe diagnostic logging for MyGeotab API lifecycle.
+   Never logs session tokens, credentials, AddInId values, or personal data. */
+function diagLog(message: string, detail?: unknown): void {
+  try {
+    if (typeof console !== "undefined" && console.log) {
+      const detailStr = detail !== undefined ? ` | detail=${String(detail).slice(0, 100)}` : "";
+      console.log(`[OPEX-VBM-AddInData] ${message}${detailStr}`);
+    }
+  } catch {
+    // Logging must never throw
+  }
+}
 const NOTIFICATION_GROUP_ID = DEFAULT_GROUP_ID;
 const AUDIT_GROUP_ID = DEFAULT_GROUP_ID;
 
@@ -152,21 +167,40 @@ export class AddInDataBookingDataProvider implements BookingDataProvider, Notifi
     this.api = api;
     this.addInId = addInId;
     this.groupId = groupId;
+    diagLog("AddInDataBookingDataProvider constructed", {
+      hasApi: !!api,
+      hasAddInId: !!addInId,
+      addInIdValid: addInId ? isValidAddInId(addInId) : false,
+    });
   }
 
   /*───────────────────── JSON-RPC wrapper over geotab.addin API ─────────────────────*/
 
   private async apiCall<T>(method: string, params: Record<string, unknown>): Promise<T> {
+    diagLog(`AddInData API call started`, { method, typeName: params.typeName });
     return new Promise((resolve, reject) => {
       if (!this.api?.call) {
+        diagLog("AddInData API call failed: geotabApi.call not available", { method });
         reject(new Error("GEOTAB_API_NOT_AVAILABLE: running outside MyGeotab Add-In context"));
         return;
       }
       if ((method === "Add" || method === "Set" || method === "Remove") && !this.addInId) {
+        diagLog("AddInData API call failed: addInId not configured", { method });
         reject(new Error("ADDIN_ID_NOT_CONFIGURED: set addInId before using AddInData storage"));
         return;
       }
-      this.api.call(method, params, (result: unknown) => resolve(result as T), (error: unknown) => reject(error ?? new Error("GEOTAB_API_ERROR")));
+      if ((method === "Add" || method === "Set" || method === "Remove") && this.addInId && !isValidAddInId(this.addInId)) {
+        diagLog("AddInData API call failed: addInId invalid format", { method });
+        reject(new Error("ADDIN_ID_INVALID: stored addInId does not match Geotab Storage API format. Enter a valid AddInId."));
+        return;
+      }
+      this.api.call(method, params, (result: unknown) => {
+        diagLog(`AddInData API call succeeded`, { method, typeName: params.typeName });
+        resolve(result as T);
+      }, (error: unknown) => {
+        diagLog(`AddInData API call failed`, { method, typeName: params.typeName, error: error instanceof Error ? error.message : String(error) });
+        reject(error ?? new Error("GEOTAB_API_ERROR"));
+      });
     });
   }
 
