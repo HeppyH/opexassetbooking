@@ -2,6 +2,7 @@ import React from "react";
 import { createRoot } from "react-dom/client";
 import App from "./ui/App";
 import "./ui/styles.css";
+import "./serviceAddin"; // Registers MyGeotab Service Add-In entry point (geotab.addin.service)
 
 type GeotabApi = {
   call?: (method: string, params: Record<string, unknown>, success: (result: unknown) => void, error?: (error: unknown) => void) => void;
@@ -16,7 +17,7 @@ type AddInLifecycle = {
 
 declare global {
   interface Window {
-    geotab?: { addin?: Record<string, () => AddInLifecycle> };
+    geotab?: { addin?: Record<string, () => AddInLifecycle> & { service?: (service: unknown) => void } };
   }
 }
 
@@ -30,7 +31,7 @@ reactRoot.render(<React.StrictMode><App /></React.StrictMode>);
 // standalone browser preview, but always register the required namespace.
 window.geotab = window.geotab ?? {};
 window.geotab.addin = window.geotab.addin ?? {};
-window.geotab.addin.OpexAssetBookingLink = () => ({
+window.geotab.addin.opexVehicleBooking = () => ({
   initialize: (api, state, callback) => {
     document.documentElement.dataset.opexVbm = "initialized";
     window.dispatchEvent(new CustomEvent("opex-vbm:initialize", { detail: { api, state } }));

@@ -102,14 +102,14 @@ All flows verified by reading implementation; no live browser interaction perfor
 ```ts
 window.geotab = window.geotab ?? {};
 window.geotab.addin = window.geotab.addin ?? {};
-window.geotab.addin.OpexAssetBookingLink = () => ({
+window.geotab.addin.opexVehicleBooking = () => ({
   initialize: (api, state, callback) => { ... dispatch CustomEvent("opex-vbm:initialize") ... callback(); },
   focus: (api, state) => { ... dispatch CustomEvent("opex-vbm:focus") ... },
   blur: (api, state) => { ... dispatch CustomEvent("opex-vbm:blur") ... },
 });
 ```
 
-- Registers the required `window.geotab.addin.OpexAssetBookingLink` namespace.
+- Registers the required `window.geotab.addin.opexVehicleBooking` namespace.
 - Lifecycle methods `initialize`/`focus`/`blur` dispatch CustomEvents that `App.tsx` listens to (`opex-vbm:initialize`, `opex-vbm:focus`) to set `geotabApi`.
 - Standalone preview remains usable (no `geotabApi` → demo mode).
 - **PASS**
@@ -182,7 +182,7 @@ Manual steps to register the OPEX VBM Add-In in MyGeotab (reference only — not
 5. **Configure required database access** for the Add-In: read access to `Device`, `User`, and `Group` entities in the `opex_trial` database (read-only; no write access needed).
 6. **Update `apps/web/src/ui/App.tsx:30`:** replace `"REPLACE_WITH_YOUR_ADDIN_ID"` with the issued Add-InId.
    - Do NOT commit or push this change without explicit approval.
-7. **Load the Add-In** in MyGeotab: the `window.geotab.addin.OpexAssetBookingLink` lifecycle (initialize/focus/blur) will be invoked by MyGeotab, supplying the signed-in `api` object via `CustomEvent("opex-vbm:initialize")`.
+7. **Load the Add-In** in MyGeotab: the `window.geotab.addin.opexVehicleBooking` lifecycle (initialize/focus/blur) will be invoked by MyGeotab, supplying the signed-in `api` object via `CustomEvent("opex-vbm:initialize")`.
 8. **Verify:** In the running Add-In, Administration page should show "Data Source: MYGEOTAB_LIVE" and "MyGeotab Connection: Connected"; the `source-status` should read "Connected to MyGeotab Add-In API."
 
 > **Important:** Do not modify live MyGeotab data. The frontend performs read-only `Get` calls on Device/User/Group. All booking transactions remain local/simulated in `localStorage`.
