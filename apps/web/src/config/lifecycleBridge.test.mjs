@@ -74,6 +74,69 @@ test("lifecycleBridge: rejects API without callable call method", () => {
   assert.strictEqual(state.api, null);
 });
 
+test("lifecycleBridge: notifies subscriber on setLifecycleApi", () => {
+  resetBridgeForTesting();
+  const receivedStates = [];
+  const unsub = subscribeToLifecycle((s) => receivedStates.push(s));
+
+  setLifecycleApi(mockApi, { userId: "user6" });
+
+  // 1 from initial subscription callback + 1 from setLifecycleApi notification
+  assert.strictEqual(receivedStates.length, 2);
+  assert.strictEqual(receivedStates[1].api, mockApi);
+
+  unsub();
+});
+
+test("lifecycleBridge: unsubscribed callback does not receive updates", () => {
+  resetBridgeForTesting();
+  const receivedStates = [];
+  const unsub = subscribeToLifecycle((s) => receivedStates.push(s));
+  unsub();
+  setLifecycleApi(mockApi, { userId: "user7" });
+
+  assert.strictEqual(receivedStates.length, 1);
+});
+
+test("lifecycleBridge: multiple subscribers receive updates", () => {
+  resetBridgeForTesting();
+  setLifecycleApi(mockApi, { userId: "user1" });
+
+  const receivedStates1 = [];
+  const receivedStates2 = [];
+  const unsub1 = subscribeToLifecycle((s) => receivedStates1.push(s));
+  const unsub2 = subscribeToLifecycle((s) => receivedStates2.push(s));
+
+  setLifecycleApi(mockApi2, { userId: "user2" });
+
+  assert.strictEqual(receivedStates1.length, 2);
+  assert.strictEqual(receivedStates1[1].api, mockApi2);
+  assert.strictEqual(receivedStates2.length, 2);
+  assert.strictEqual(receivedStates2[1].api, mockApi2);
+
+  unsub1();
+  unsub2();
+});
+
+test("lifecycleBridge: unsubscribing one subscriber does not affect others", () => {
+  resetBridgeForTesting();
+  setLifecycleApi(mockApi, { userId: "user1" });
+
+  const receivedStates1 = [];
+  const receivedStates2 = [];
+  const unsub1 = subscribeToLifecycle((s) => receivedStates1.push(s));
+  const unsub2 = subscribeToLifecycle((s) => receivedStates2.push(s));
+
+  unsub1();
+  setLifecycleApi(mockApi2, { userId: "user2" });
+
+  assert.strictEqual(receivedStates1.length, 1);
+  assert.strictEqual(receivedStates2.length, 2);
+  assert.strictEqual(receivedStates2[1].api, mockApi2);
+
+  unsub2();
+});
+
 test("lifecycleBridge: stores API even when getSession throws", () => {
   resetBridgeForTesting();
   const apiWithFailingGetSession = {
@@ -105,4 +168,26 @@ test("lifecycleBridge: bridge state persists across multiple setLifecycleApi cal
   const state2 = getLifecycleApi();
   assert.strictEqual(state2.api, mockApi2);
   assert.deepStrictEqual(state2.state, { shared: false });
+});
+
+test("lifecycleBridge: subscribe/unsubscribe/resubscribe behavior", () => {
+  resetBridgeForTesting();
+  setLifecycleApi(mockApi, { userId: "user1" });
+
+  const receivedStates = [];
+  const unsub1 = subscribeToLifecycle((s) => receivedStates.push(s));
+  unsub1();
+
+  setLifecycleApi(mockApi2, { userId: "user2" });
+  assert.strictEqual(receivedStates.length, 1); // Immediate callback from re-subscribe
+
+  const unsub2 = subscribeToLifecycle((s) => receivedStates.push(s));
+  assert.strictEqual(receivedStates.length, 2); // Re-subscribed, gets current state
+  assert.strictEqual(receivedStates[1].api, mockApi2);
+
+  setLifecycleApi(mockApi, { userId: "user3" });
+  assert.strictEqual(receivedStates.length, 3); // Re-subscribed, gets new update
+  assert.strictEqual(receivedStates[2].api, mockApi);
+
+  unsub2();
 });

@@ -1,4 +1,4 @@
-import { useState, useCallback, useEffect, useMemo } from "react";
+import { useState, useCallback, useEffect, useMemo, useRef } from "react";
 import { bookingDataProvider } from "../data/dataProvider";
 import type { ResolvedAsset, ResolvedBooking, ResolvedUser, BookingDataProvider, OpexNotification, NotificationType, NotificationDataProvider } from "../data/types";
 import { createAddInDataProvider, AddInDataBookingDataProvider } from "../data/addinDataProvider";
@@ -1646,6 +1646,23 @@ export default function App() {
   const [addInIdInput, setAddInIdInput] = useState<string>("");
   const addInIdValid = isValidAddInId(addInId);
   const [currentMyGeotabUser, setCurrentMyGeotabUser] = useState<{ userName?: string; database?: string; server?: string } | null>(null);
+
+  // Refs to avoid stale closures in lifecycle subscription
+  const geotabApiRef = useRef<GeotabApi | null>(null);
+  const addInIdRef = useRef(addInId);
+  const modeRef = useRef(mode);
+  const lastGetSessionApiRef = useRef<GeotabApi | null>(null);
+
+  // Keep refs in sync with state
+  useEffect(() => {
+    geotabApiRef.current = geotabApi;
+  }, [geotabApi]);
+  useEffect(() => {
+    addInIdRef.current = addInId;
+  }, [addInId]);
+  useEffect(() => {
+    modeRef.current = mode;
+  }, [mode]);
   const [providerError, setProviderError] = useState<string | null>(null);
   const [notifications, setNotifications] = useState<OpexNotification[]>([]);
   const [notificationDropdownOpen, setNotificationDropdownOpen] = useState(false);
@@ -1675,14 +1692,17 @@ export default function App() {
 
     // Read stored lifecycle state from bridge (covers initialize() before mount)
     const initialBridgeState = getLifecycleApi();
-    if (mounted && initialBridgeState.api && !geotabApi) {
+    if (mounted && initialBridgeState.api && !geotabApiRef.current) {
       setGeotabApi(initialBridgeState.api);
+      geotabApiRef.current = initialBridgeState.api;
+      lastGetSessionApiRef.current = initialBridgeState.api;
       // Retrieve current MyGeotab user identity from Add-In context
       initialBridgeState.api.getSession?.((session) => {
         if (mounted && session) {
           setCurrentMyGeotabUser(session);
-          if (addInId && mode === "DEMO") {
+          if (addInIdRef.current && modeRef.current === "DEMO") {
             setMode("ADDIN_DATA");
+            modeRef.current = "ADDIN_DATA";
             setProviderError(null);
           }
         }
@@ -1692,17 +1712,23 @@ export default function App() {
     // Subscribe to future lifecycle updates
     const unsubscribe = subscribeToLifecycle((bridgeState) => {
       if (!mounted) return;
-      if (bridgeState.api && bridgeState.api !== geotabApi) {
+      if (bridgeState.api && bridgeState.api !== geotabApiRef.current) {
         setGeotabApi(bridgeState.api);
-        bridgeState.api.getSession?.((session) => {
-          if (mounted && session) {
-            setCurrentMyGeotabUser(session);
-            if (addInId && mode === "DEMO") {
-              setMode("ADDIN_DATA");
-              setProviderError(null);
+        geotabApiRef.current = bridgeState.api;
+        // Only call getSession once per unique API object
+        if (lastGetSessionApiRef.current !== bridgeState.api) {
+          lastGetSessionApiRef.current = bridgeState.api;
+          bridgeState.api.getSession?.((session) => {
+            if (mounted && session) {
+              setCurrentMyGeotabUser(session);
+              if (addInIdRef.current && modeRef.current === "DEMO") {
+                setMode("ADDIN_DATA");
+                modeRef.current = "ADDIN_DATA";
+                setProviderError(null);
+              }
             }
-          }
-        });
+          });
+        }
       }
     });
 
