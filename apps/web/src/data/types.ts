@@ -83,6 +83,8 @@ export interface OpexBooking {
 export interface ResolvedAsset {
   id: string;
   asset_code: string;
+  asset_name: string;
+  serial_number: string | null;
   make_model: string;
   asset_class: string;
   registration_no: string | null;
@@ -97,6 +99,7 @@ export interface ResolvedBooking {
   requested_class: string;
   asset_id: string | null;
   asset_code: string | null;
+  asset_name: string | null;
   registration_no: string | null;
   start_at: string;
   end_at: string;
