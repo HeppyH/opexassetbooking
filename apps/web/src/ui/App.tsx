@@ -19,6 +19,8 @@ type GeotabApi = {
 type Asset = {
   id: string;
   asset_code: string;
+  asset_name: string;
+  serial_number: string | null;
   make_model: string;
   asset_class: string;
   registration_no: string | null;
@@ -32,6 +34,7 @@ type Booking = {
   requested_class: string;
   asset_id: string | null;
   asset_code: string | null;
+  asset_name: string | null;
   registration_no: string | null;
   start_at: string;
   end_at: string;
@@ -610,7 +613,7 @@ function Dashboard({
                   {recent.map(b => (
                     <tr key={b.id}>
                       <td>#{b.id.slice(-4)}</td>
-                      <td><b>{b.asset_code || "Unassigned"}</b></td>
+                      <td><b>{b.asset_name || "Unassigned"}</b></td>
                       <td>{b.requester_name}</td>
                       <td>{formatDate(b.start_at)}</td>
                       <td>{formatTime(b.start_at)} – {formatTime(b.end_at)}</td>
@@ -777,7 +780,7 @@ function NewBooking({
                 <select className="form-control" value={form.asset} onChange={e => handleChange("asset", e.target.value)} required>
                   <option value="">Select an asset</option>
                   {availableAssets.map(a => (
-                    <option key={a.id} value={a.id}>{a.asset_code} · {a.make_model} ({a.registration_no || "No plate"})</option>
+                    <option key={a.id} value={a.id}>{a.asset_name} · {a.registration_no || "No plate"}</option>
                   ))}
                 </select>
               </div>
@@ -948,7 +951,7 @@ function MyBookings({
                   {activeTab.map(b => (
                     <tr key={b.id}>
                       <td>#{b.id.slice(-4)}</td>
-                      <td><b>{b.asset_code || "Unassigned"}</b></td>
+                      <td><b>{b.asset_name || "Unassigned"}</b></td>
                       <td>{formatDate(b.start_at)}</td>
                       <td>{formatTime(b.start_at)} – {formatTime(b.end_at)}</td>
                       <td>{b.destination || "—"}</td>
@@ -1069,7 +1072,7 @@ function ApprovalInbox({
                     <tr key={b.id}>
                       <td>#{b.id.slice(-4)}</td>
                       <td>{b.requester_name}</td>
-                      <td>{b.asset_code || "Unassigned"}</td>
+                      <td>{b.asset_name || "Unassigned"}</td>
                       <td>{formatDate(b.start_at)}</td>
                       <td>{b.destination || "—"}</td>
                       <td>{formatDate(b.created_at)}</td>
@@ -1196,7 +1199,7 @@ function AssetAvailability({
               <table className="data-table">
                 <thead>
                   <tr>
-                    <th>Asset</th><th>License Plate</th><th>Asset Type</th><th>MyGeotab Device ID</th><th>Availability</th><th>Current Booking</th>
+                    <th>Asset Name</th><th>License Plate</th><th>Serial Number</th><th>Asset Type</th><th>MyGeotab Device ID</th><th>Availability</th><th>Current Booking</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -1204,8 +1207,9 @@ function AssetAvailability({
                     const currentBooking = bookingByAsset.get(a.id);
                     return (
                       <tr key={a.id}>
-                        <td><b>{a.asset_code}</b></td>
+                        <td><b>{a.asset_name}</b></td>
                         <td>{a.registration_no || "—"}</td>
+                        <td>{a.serial_number || "—"}</td>
                         <td>{a.asset_class.replace(/_/g, " ")}</td>
                         <td>{a.geotab_device_id || "Not mapped"}</td>
                         <td><AssetStatusBadge status={a.status} /></td>
@@ -1557,7 +1561,7 @@ function ViewDetailsModal({
           <div className="detail-grid">
             <div className="detail-row"><label>Booking ID</label><span className="value">#{booking.id.slice(-4)}</span></div>
             <div className="detail-row"><label>User</label><span className="value">{booking.requester_name}</span></div>
-            <div className="detail-row"><label>Asset</label><span className="value">{booking.asset_code || "Unassigned"} {asset ? `(${asset.registration_no || "No plate"})` : ""}</span></div>
+            <div className="detail-row"><label>Asset</label><span className="value">{booking.asset_name || "Unassigned"} {asset ? `(${asset.registration_no || "No plate"})` : ""}</span></div>
             <div className="detail-row"><label>Asset Class</label><span className="value">{booking.requested_class.replace(/_/g, " ")}</span></div>
             <div className="detail-row"><label>Start</label><span className="value">{formatDateTime(booking.start_at)}</span></div>
             <div className="detail-row"><label>End</label><span className="value">{formatDateTime(booking.end_at)}</span></div>
@@ -2062,7 +2066,7 @@ export default function App() {
   const onExportDashboard = useCallback(() => {
     const data = dashboardBookings.map(b => ({
       "Booking ID": b.id,
-      Asset: b.asset_code || "Unassigned",
+      Asset: b.asset_name || "Unassigned",
       "License Plate": b.registration_no || "",
       User: b.requester_name,
       "Booking Date": b.start_at,
@@ -2077,7 +2081,7 @@ export default function App() {
   const onExportMyBookings = useCallback(() => {
     const data = myBookingsData.map(b => ({
       "Booking ID": b.id,
-      Asset: b.asset_code || "Unassigned",
+      Asset: b.asset_name || "Unassigned",
       "Booking Date": b.start_at,
       "Start Time": b.start_at,
       "End Time": b.end_at,
@@ -2091,7 +2095,7 @@ export default function App() {
     const data = approvalBookings.map(b => ({
       "Request ID": b.id,
       User: b.requester_name,
-      Asset: b.asset_code || "Unassigned",
+      Asset: b.asset_name || "Unassigned",
       "Booking Date": b.start_at,
       Destination: b.destination || "",
       "Request Date": b.created_at,
@@ -2101,8 +2105,9 @@ export default function App() {
 
   const onExportFleet = useCallback(() => {
     const data = assets.map(a => ({
-      "Asset Name": a.asset_code,
+      "Asset Name": a.asset_name,
       "License Plate": a.registration_no || "",
+      "Serial Number": a.serial_number || "",
       "Asset Type": a.asset_class,
       "MyGeotab Device ID": a.geotab_device_id || "",
       "Asset Group": "North Sumatra",

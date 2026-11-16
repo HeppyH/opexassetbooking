@@ -36,12 +36,34 @@ function resolveAsset(device: MyGeotabDevice): ResolvedAsset {
   return {
     id: device.id,
     asset_code: `VEH-${device.id.slice(-3).toUpperCase()}`,
+    asset_name: parseVehicleName(device.name ?? ""),
+    serial_number: device.serialNumber ?? null,
     make_model: `${device.make ?? "Unknown"} ${device.model ?? "Asset"}`,
     asset_class: device.vehicleClass ?? "OPERATIONAL_4X4",
     registration_no: device.licensePlate ?? null,
     status: device.status,
     geotab_device_id: device.id,
   };
+}
+
+function parseVehicleName(rawName: string): string {
+  if (!rawName || rawName.trim() === "") {
+    return "Unknown Vehicle";
+  }
+
+  const parts = rawName.split("_");
+  if (parts.length <= 1) {
+    return rawName.trim();
+  }
+
+  const nameParts = parts.slice(1);
+  if (nameParts.length === 1) {
+    return nameParts[0].trim();
+  }
+
+  const prefix = nameParts.slice(0, -1).join(" ").trim();
+  const suffix = nameParts[nameParts.length - 1].trim();
+  return `${prefix} - ${suffix}`;
 }
 
 function resolveUser(user: MyGeotabUser): ResolvedUser {
@@ -67,6 +89,7 @@ function resolveBooking(
     requested_class: booking.requestedClass,
     asset_id: booking.deviceId ?? null,
     asset_code: device ? `VEH-${device.id.slice(-3).toUpperCase()}` : null,
+    asset_name: device ? parseVehicleName(device.name ?? "") : null,
     registration_no: device?.licensePlate ?? null,
     start_at: booking.startAt,
     end_at: booking.endAt,
