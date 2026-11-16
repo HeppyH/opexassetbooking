@@ -1697,16 +1697,22 @@ export default function App() {
       geotabApiRef.current = initialBridgeState.api;
       lastGetSessionApiRef.current = initialBridgeState.api;
       // Retrieve current MyGeotab user identity from Add-In context
-      initialBridgeState.api.getSession?.((session) => {
-        if (mounted && session) {
-          setCurrentMyGeotabUser(session);
-          if (addInIdRef.current && modeRef.current === "DEMO") {
-            setMode("ADDIN_DATA");
-            modeRef.current = "ADDIN_DATA";
-            setProviderError(null);
+      try {
+        initialBridgeState.api.getSession?.((session) => {
+          if (mounted && session) {
+            setCurrentMyGeotabUser(session);
+            if (addInIdRef.current && modeRef.current === "DEMO") {
+              setMode("ADDIN_DATA");
+              modeRef.current = "ADDIN_DATA";
+              setProviderError(null);
+            }
           }
-        }
-      });
+        });
+      } catch (err) {
+        // getSession() threw synchronously; API object is still valid, just session retrieval failed
+        const msg = err instanceof Error ? err.message : "Failed to retrieve MyGeotab session.";
+        setMyGeotabError(msg);
+      }
     }
 
     // Subscribe to future lifecycle updates
@@ -1718,16 +1724,22 @@ export default function App() {
         // Only call getSession once per unique API object
         if (lastGetSessionApiRef.current !== bridgeState.api) {
           lastGetSessionApiRef.current = bridgeState.api;
-          bridgeState.api.getSession?.((session) => {
-            if (mounted && session) {
-              setCurrentMyGeotabUser(session);
-              if (addInIdRef.current && modeRef.current === "DEMO") {
-                setMode("ADDIN_DATA");
-                modeRef.current = "ADDIN_DATA";
-                setProviderError(null);
+          try {
+            bridgeState.api.getSession?.((session) => {
+              if (mounted && session) {
+                setCurrentMyGeotabUser(session);
+                if (addInIdRef.current && modeRef.current === "DEMO") {
+                  setMode("ADDIN_DATA");
+                  modeRef.current = "ADDIN_DATA";
+                  setProviderError(null);
+                }
               }
-            }
-          });
+            });
+          } catch (err) {
+            // getSession() threw synchronously; API object is still valid, just session retrieval failed
+            const msg = err instanceof Error ? err.message : "Failed to retrieve MyGeotab session.";
+            setMyGeotabError(msg);
+          }
         }
       }
     });

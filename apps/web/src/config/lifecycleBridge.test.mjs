@@ -191,3 +191,46 @@ test("lifecycleBridge: subscribe/unsubscribe/resubscribe behavior", () => {
 
   unsub2();
 });
+
+test("lifecycleBridge: getSession synchronous exception does not invalidate API object", () => {
+  resetBridgeForTesting();
+  const apiWithFailingGetSession = {
+    call: (method, params, success, error) => { success({ result: "ok" }); },
+    getSession: (callback) => { throw new Error("session failed"); },
+  };
+  setLifecycleApi(apiWithFailingGetSession, null);
+  const state = getLifecycleApi();
+  assert.strictEqual(state.initialized, true);
+  assert.strictEqual(state.api, apiWithFailingGetSession);
+});
+
+test("lifecycleBridge: missing getSession method is handled gracefully", () => {
+  resetBridgeForTesting();
+  const apiWithoutGetSession = {
+    call: (method, params, success, error) => { success({ result: "ok" }); },
+  };
+  setLifecycleApi(apiWithoutGetSession, null);
+  const state = getLifecycleApi();
+  assert.strictEqual(state.initialized, true);
+  assert.strictEqual(state.api, apiWithoutGetSession);
+});
+
+test("lifecycleBridge: session callback returning null does not invalidate API", () => {
+  resetBridgeForTesting();
+  const apiWithNullSession = {
+    call: (method, params, success, error) => { success({ result: "ok" }); },
+    getSession: (callback) => { callback(null); },
+  };
+  setLifecycleApi(apiWithNullSession, null);
+  const state = getLifecycleApi();
+  assert.strictEqual(state.initialized, true);
+  assert.strictEqual(state.api, apiWithNullSession);
+});
+
+test("lifecycleBridge: successful session retrieval", () => {
+  resetBridgeForTesting();
+  setLifecycleApi(mockApi, null);
+  const state = getLifecycleApi();
+  assert.strictEqual(state.initialized, true);
+  assert.strictEqual(state.api, mockApi);
+});
