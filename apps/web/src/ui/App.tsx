@@ -1755,7 +1755,8 @@ export default function App() {
       let mounted = true;
 
       // Determine effective provider: no silent fallback to DEMO when LIVE is intended
-      const effectiveMode = mode === "ADDIN_DATA" && !geotabApi ? "DEMO" : mode;
+      // ADDIN_DATA mode requires a valid MyGeotab API and AddInId; never fall back to DEMO
+      const effectiveMode = mode;
       const provider: BookingDataProvider = effectiveMode === "ADDIN_DATA"
         ? createAddInDataProvider(geotabApi, addInId)
         : bookingDataProvider;
@@ -1829,8 +1830,9 @@ export default function App() {
   }, [addInId]);
 
   const provider = useMemo(() => {
-    const effectiveMode = mode === "ADDIN_DATA" && !geotabApi ? "DEMO" : mode;
-    if (effectiveMode === "ADDIN_DATA") {
+    // ADDIN_DATA mode requires a valid MyGeotab API and AddInId;
+    // never fall back to DEMO/localStorage when LIVE is intended
+    if (mode === "ADDIN_DATA") {
       return createAddInDataProvider(geotabApi, addInId);
     }
     return bookingDataProvider;
