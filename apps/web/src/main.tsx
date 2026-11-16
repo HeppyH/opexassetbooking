@@ -1,4 +1,5 @@
 import React from "react";
+import { setLifecycleApi } from "./config/lifecycleBridge";
 import { createRoot } from "react-dom/client";
 import App from "./ui/App";
 import "./ui/styles.css";
@@ -33,11 +34,13 @@ window.geotab = window.geotab ?? {};
 window.geotab.addin = window.geotab.addin ?? {};
 window.geotab.addin.opexVehicleBooking = () => ({
   initialize: (api, state, callback) => {
+    setLifecycleApi(api, state);
     document.documentElement.dataset.opexVbm = "initialized";
     window.dispatchEvent(new CustomEvent("opex-vbm:initialize", { detail: { api, state } }));
     callback();
   },
   focus: (api, state) => {
+    setLifecycleApi(api, state);
     window.dispatchEvent(new CustomEvent("opex-vbm:focus", { detail: { api, state } }));
   },
   blur: (api, state) => {
