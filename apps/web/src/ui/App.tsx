@@ -4,6 +4,7 @@ import type { ResolvedAsset, ResolvedBooking, ResolvedUser, BookingDataProvider,
 import { createAddInDataProvider } from "../data/addinDataProvider";
 import { createNotificationEngine } from "../data/notificationService";
 import { useAutoRefresh } from "./autoRefresh";
+import { formatStatusLabel, statusClassKey } from "./statusHelpers";
 import { DEFAULT_ADDIN_ID, ADDIN_ID_STORAGE_KEY, resolveAddInId, isValidAddInId } from "../config/addinId";
 import { getLifecycleApi, subscribeToLifecycle } from "../config/lifecycleBridge";
 import {
@@ -224,17 +225,9 @@ function StatCard({ label, value, sub, trend }: {
   );
 }
 
-function StatusBadge({ status }: { status: string }) {
-  const map: Record<string, string> = {
-    PENDING_APPROVAL: "badge-pending",
-    APPROVED: "badge-approved",
-    ASSIGNED: "badge-assigned",
-    COMPLETED: "badge-completed",
-    REJECTED: "badge-rejected",
-    CANCELLED: "badge-cancelled",
-  };
-  const cls = "badge " + (map[status] || "badge-completed");
-  const label = status.replace(/_/g, " ");
+function StatusBadge({ status }: { status?: string }) {
+  const cls = "badge " + statusClassKey(status);
+  const label = formatStatusLabel(status);
   return <span className={cls}>{label}</span>;
 }
 
