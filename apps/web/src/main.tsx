@@ -4,6 +4,7 @@ import { createRoot } from "react-dom/client";
 import App from "./ui/App";
 import "./ui/styles.css";
 import "./serviceAddin"; // Registers MyGeotab Service Add-In entry point (geotab.addin.service)
+import "./config/lifecycleDiagnostics"; // Diagnostic interface (disabled by default; enabled via Vite define)
 
 type GeotabApi = {
   call?: (method: string, params: Record<string, unknown>, success: (result: unknown) => void, error?: (error: unknown) => void) => void;
