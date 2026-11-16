@@ -371,11 +371,7 @@ export class AddInDataBookingDataProvider implements BookingDataProvider, Notifi
   }
 
   async updateBookingStatus(id: string, status: string, approverId?: string, approvalRemarks?: string): Promise<void> {
-    const records = await this.apiCall<AddInDataRecord[]>("Get", {
-      typeName: "AddInData",
-      search: { addInId: this.addInId },
-    });
-    const record = (records || []).find(r => r.id === id);
+    const record = await this.findBookingRecord(id);
     if (!record) throw new Error(`BOOKING_NOT_FOUND: ${id}`);
     const booking = deserializeBooking(record.details);
     booking.status = status as OpexBooking["status"];
@@ -387,17 +383,43 @@ export class AddInDataBookingDataProvider implements BookingDataProvider, Notifi
       typeName: "AddInData",
       entity: {
         addInId: this.addInId,
-        id,
+        id: record.id,
         details: serializeBooking(booking),
         groups: [{ id: this.groupId }],
       },
     });
   }
 
+  /**
+   * Shared booking record lookup that resolves the AddInData server record ID.
+   * Matches by either:
+   *   - record.id === bookingId (server record ID)
+   *   - deserializeBooking(record.details).id === bookingId (application ID stored in details)
+   * Malformed details are skipped gracefully so a single bad record cannot break the lookup.
+   */
+  async findBookingRecord(bookingId: string): Promise<AddInDataRecord | null> {
+    const records = await this.apiCall<AddInDataRecord[]>("Get", {
+      typeName: "AddInData",
+      search: { addInId: this.addInId },
+    });
+    for (const record of records || []) {
+      if (record.id === bookingId) return record;
+      try {
+        const booking = deserializeBooking(record.details);
+        if (booking && booking.id === bookingId) return record;
+      } catch {
+        // Skip malformed records
+      }
+    }
+    return null;
+  }
+
   async deleteBooking(id: string): Promise<void> {
+    const record = await this.findBookingRecord(id);
+    if (!record) throw new Error(`BOOKING_NOT_FOUND: ${id}`);
     await this.apiCall<unknown>("Remove", {
       typeName: "AddInData",
-      entity: { id },
+      entity: { id: record.id },
     });
   }
 
