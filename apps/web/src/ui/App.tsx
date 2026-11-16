@@ -1,17 +1,35 @@
 import { useState, useCallback, useEffect, useMemo, useRef } from "react";
 import { bookingDataProvider } from "../data/dataProvider";
 import type { ResolvedAsset, ResolvedBooking, ResolvedUser, BookingDataProvider, OpexNotification, NotificationType, NotificationDataProvider } from "../data/types";
-import { createAddInDataProvider, AddInDataBookingDataProvider } from "../data/addinDataProvider";
-import { createNotificationEngine, NotificationEngine } from "../data/notificationService";
+import { createAddInDataProvider } from "../data/addinDataProvider";
+import { createNotificationEngine } from "../data/notificationService";
 import { useAutoRefresh } from "./autoRefresh";
 import { DEFAULT_ADDIN_ID, ADDIN_ID_STORAGE_KEY, resolveAddInId, isValidAddInId } from "../config/addinId";
-import { getLifecycleApi, subscribeToLifecycle, type LifecycleBridgeState } from "../config/lifecycleBridge";
+import { getLifecycleApi, subscribeToLifecycle } from "../config/lifecycleBridge";
+import {
+  resolveAuthenticatedPrincipal,
+  canPerformLiveWrite,
+  getLiveBlockedReason,
+  getActorIdForMode,
+  type IdentityResolutionState,
+  type AppMode,
+} from "../auth/identityResolver";
+import { canRunDemoOnlyOperation, assertDemoOnlyOperation, assertProviderNotLiveForDemoOperation, getStateResetOnModeSwitch, isKnownMode } from "../safety/modeGuards";
+import { emitAuditEvent, snapshotBooking, type AuditAction } from "../audit/auditTrail";
+import { getTenantTimezone, toTenantLocalParts, toIsoFromTenantParts, formatTenantDateTime } from "../config/tenantTimezone";
 
 const TENANT = import.meta.env.VITE_GEOTAB_DATABASE || "opex_trial";
 
 type GeotabApi = {
   call?: (method: string, params: Record<string, unknown>, success: (result: unknown) => void, error?: (error: unknown) => void) => void;
   getSession?: (callback: (session: { userName?: string; database?: string; server?: string } | null) => void) => void;
+};
+
+type ActorContext = {
+  id: string;
+  name: string;
+  roles: string[];
+  kind: "authenticated" | "demo";
 };
 
 /*───────────────────── Types ─────────────────────*/
@@ -26,6 +44,7 @@ type Asset = {
   registration_no: string | null;
   status: string;
   geotab_device_id: string | null;
+  groupIds?: string[];
 };
 type Booking = {
   id: string;
@@ -46,8 +65,12 @@ type Booking = {
   status: string;
   version: number;
   created_at: string;
+  updated_at: string;
+  driver_id: string | null;
+  driver_name: string | null;
+  approver_id: string | null;
+  approval_remarks: string | null;
 };
-type DemoUser = { id: string; name: string; roles: string[] };
 
 type Toast = {
   id: string;
@@ -426,7 +449,6 @@ function NotificationDropdown({
   onMarkAllAsRead,
   onClose,
   onNotificationClick,
-  demoUserId,
 }: {
   notifications: OpexNotification[];
   unreadCount: number;
@@ -434,7 +456,6 @@ function NotificationDropdown({
   onMarkAllAsRead: () => void;
   onClose: () => void;
   onNotificationClick: (id: string) => void;
-  demoUserId: string;
 }) {
   const unread = notifications.filter(n => !n.is_read);
   const read = notifications.filter(n => n.is_read);
@@ -634,53 +655,123 @@ function Dashboard({
 function NewBooking({
   assets,
   bookings,
-  demoUser,
+  actor,
+  canWrite,
+  blockedReason,
   onCreateBooking,
-  submitting,
+  submitting = false,
   addToast,
   navigateToMyBookings,
+  users,
 }: {
   assets: Asset[];
   bookings: Booking[];
-  demoUser: DemoUser | null;
+  actor: ActorContext | null;
+  canWrite: boolean;
+  blockedReason: string | null;
   onCreateBooking: (input: {
     assetId: string; startAt: string; endAt: string; destination: string;
     purpose: string; notes: string;
+    driverId?: string | null; driverName?: string | null;
   }) => void;
-  submitting: boolean;
+  submitting?: boolean;
   addToast: (type: Toast["type"], text: string) => void;
   navigateToMyBookings: () => void;
+  users: ResolvedUser[];
 }) {
+  const tenant = getTenantTimezone();
   const [form, setForm] = useState({
-    asset: "", date: "", startTime: "", endTime: "", destination: "", purpose: "", notes: "",
+    asset: "", driver: "", startDate: "", endDate: "", startTime: "", endTime: "", destination: "", purpose: "", notes: "",
   });
+  const [driverError, setDriverError] = useState<string | null>(null);
   const [conflictError, setConflictError] = useState<string | null>(null);
   const [confirmOpen, setConfirmOpen] = useState(false);
 
   const availableAssets = assets.filter(a => a.status === "AVAILABLE");
+  const eligibleDrivers = users.filter(u => u.roles?.some(r => r === "EMPLOYEE" || r === "GA" || r === "MANAGEMENT"));
+
+  const resolveDriverForAsset = (assetId: string): ResolvedUser | null => {
+    if (!assetId) return null;
+    const asset = assets.find(a => a.id === assetId);
+    if (!asset) return null;
+    // Auto-resolution: prefer a driver whose company group overlaps the asset group.
+    // The mock/live data does not store per-asset driver mappings, so we pick the first
+    // eligible driver that shares a group with the asset; otherwise the first eligible driver.
+    const assetGroups = (asset as any).groupIds as string[] | undefined;
+    if (Array.isArray(assetGroups) && assetGroups.length > 0) {
+      const byGroup = eligibleDrivers.find(u => Array.isArray((u as any).companyGroups) && (u as any).companyGroups.some((g: string) => assetGroups.includes(g)));
+      if (byGroup) return byGroup;
+    }
+    return eligibleDrivers.length > 0 ? eligibleDrivers[0] : null;
+  };
 
   const handleChange = (key: string, value: string) => {
-    setForm(prev => ({ ...prev, [key]: value }));
+    setForm(prev => {
+      const next = { ...prev, [key]: value };
+      if (key === "asset") {
+        // Auto-resolve driver when asset changes and no manual override is set.
+        if (value) {
+          const resolved = resolveDriverForAsset(value);
+          if (resolved) {
+            next.driver = resolved.id;
+            setDriverError(null);
+          } else {
+            next.driver = "";
+          }
+        } else {
+          next.driver = "";
+        }
+      }
+      return next;
+    });
     setConflictError(null);
+    setDriverError(null);
+  };
+
+  const handleDriverChange = (value: string) => {
+    setForm(prev => ({ ...prev, driver: value }));
+    setDriverError(null);
+  };
+
+  const handleClearDriver = () => {
+    setForm(prev => ({ ...prev, driver: "" }));
+    // Re-resolve from current asset so the field stays populated when possible.
+    if (form.asset) {
+      const resolved = resolveDriverForAsset(form.asset);
+      if (resolved) {
+        setForm(prev => ({ ...prev, driver: resolved.id }));
+      }
+    }
   };
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     setConflictError(null);
+    setDriverError(null);
 
-    if (!demoUser) {
-      addToast("error", "Please select a demo user first.");
+    if (!actor) {
+      addToast("error", blockedReason || "No acting identity available.");
       return;
     }
-    if (!form.asset || !form.date || !form.startTime || !form.endTime || !form.destination || !form.purpose) {
+    if (!canWrite) {
+      addToast("error", blockedReason || "Writes are not available.");
+      return;
+    }
+    if (!form.asset || !form.startDate || !form.endDate || !form.startTime || !form.endTime || !form.destination || !form.purpose) {
       addToast("error", "Please fill in all required fields.");
       return;
     }
 
-    const start = new Date(`${form.date}T${form.startTime}`);
-    const end = new Date(`${form.date}T${form.endTime}`);
+    const startIso = toIsoFromTenantParts(form.startDate, form.startTime, tenant.timezone);
+    const endIso = toIsoFromTenantParts(form.endDate, form.endTime, tenant.timezone);
+    if (!startIso || !endIso) {
+      addToast("error", "Invalid date or time. Please use the format shown.");
+      return;
+    }
+    const start = new Date(startIso);
+    const end = new Date(endIso);
     if (end <= start) {
-      addToast("error", "End time must be after start time.");
+      addToast("error", "End date/time must be after start date/time.");
       return;
     }
 
@@ -688,6 +779,20 @@ function NewBooking({
     if (!selectedAsset || selectedAsset.status !== "AVAILABLE") {
       addToast("error", "Selected asset is not available.");
       return;
+    }
+
+    // Driver is optional. If provided, it must be a known user.
+    let driverId: string | null = null;
+    let driverName: string | null = null;
+    if (form.driver) {
+      const driver = users.find(u => u.id === form.driver);
+      if (!driver) {
+        setDriverError("Selected driver is not recognized.");
+        addToast("error", "Selected driver is not recognized.");
+        return;
+      }
+      driverId = driver.id;
+      driverName = driver.name;
     }
 
     const conflictStatuses = ["PENDING_APPROVAL", "APPROVED", "ASSIGNED"];
@@ -709,10 +814,14 @@ function NewBooking({
 
   const handleConfirmSubmit = () => {
     setConfirmOpen(false);
+    const startIso = toIsoFromTenantParts(form.startDate, form.startTime, tenant.timezone)!;
+    const endIso = toIsoFromTenantParts(form.endDate, form.endTime, tenant.timezone)!;
     onCreateBooking({
       assetId: form.asset,
-      startAt: new Date(`${form.date}T${form.startTime}`).toISOString(),
-      endAt: new Date(`${form.date}T${form.endTime}`).toISOString(),
+      driverId: form.driver || null,
+      driverName: form.driver ? (users.find(u => u.id === form.driver)?.name || null) : null,
+      startAt: startIso,
+      endAt: endIso,
       destination: form.destination,
       purpose: form.purpose,
       notes: form.notes,
@@ -729,18 +838,18 @@ function NewBooking({
         subtitle="Reserve an asset for your trip. Conflicting bookings are blocked automatically."
       />
 
-      {demoUser && (
+      {actor && !blockedReason && (
         <div className="notice demo">
-          <span style={{ fontWeight: 600 }}>Booking as:</span> <b>{demoUser.name}</b> ({demoUser.id}) — demo identity, not authenticated MyGeotab
+          <span style={{ fontWeight: 600 }}>Booking as:</span> <b>{actor.name}</b> ({actor.id}) — {actor.kind === "authenticated" ? "verified MyGeotab identity" : "demo identity, not authenticated MyGeotab"}
         </div>
       )}
-      {!demoUser && (
+      {blockedReason && (
         <div className="notice error">
-          No demo user selected. Choose one from the topbar to create bookings.
+          {blockedReason}
         </div>
       )}
 
-      {conflictError && (
+            {conflictError && (
         <div className="notice error">{conflictError}</div>
       )}
 
@@ -748,7 +857,7 @@ function NewBooking({
         <div className="panel-head">
           <div className="panel-head-content">
             <h2>Booking Form</h2>
-            <p>Select asset and trip details.</p>
+            <p>Select asset and trip details. Times are interpreted in the tenant timezone (Asia/Jakarta, WIB UTC+7).</p>
           </div>
         </div>
         <div className="panel-body">
@@ -758,8 +867,8 @@ function NewBooking({
               <div className="form-row">
                 <div className="form-group">
                   <label>User</label>
-                  <select className="form-control" value={demoUser?.id || ""} disabled onChange={() => {}}>
-                    <option value={demoUser?.id || ""}>{demoUser ? demoUser.name : "Select user"}</option>
+                  <select className="form-control" value={actor?.id || ""} disabled onChange={() => {}}>
+                    <option value={actor?.id || ""}>{actor ? actor.name : "Select user"}</option>
                   </select>
                 </div>
                 <div className="form-group">
@@ -784,18 +893,38 @@ function NewBooking({
                   ))}
                 </select>
               </div>
+              <div className="form-group">
+                <label>Driver <span style={{ color: "#9CA3AF", fontWeight: 400 }}>(optional — auto-resolved from asset, overrideable)</span></label>
+                <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                  <select className="form-control" value={form.driver} onChange={e => handleDriverChange(e.target.value)}>
+                    <option value="">Auto-resolve from asset</option>
+                    {eligibleDrivers.map(u => (
+                      <option key={u.id} value={u.id}>{u.name} ({u.id})</option>
+                    ))}
+                  </select>
+                  {form.driver && (
+                    <button type="button" className="btn btn-secondary" style={{ whiteSpace: "nowrap" }} onClick={handleClearDriver}>Clear</button>
+                  )}
+                </div>
+                {driverError && <span style={{ color: "#DC2626", fontSize: 12 }}>{driverError}</span>}
+                <span style={{ fontSize: 12, color: "#6B7280" }}>Leave blank to auto-assign a driver based on the selected asset. You may override at any time.</span>
+              </div>
             </div>
 
             <div className="form-section">
               <div className="form-section-label">Schedule</div>
               <div className="form-row">
                 <div className="form-group">
-                  <label>Booking Date</label>
-                  <input className="form-control" type="date" value={form.date} onChange={e => handleChange("date", e.target.value)} required />
+                  <label>Start Date</label>
+                  <input className="form-control" type="date" value={form.startDate} onChange={e => handleChange("startDate", e.target.value)} required />
                 </div>
                 <div className="form-group">
                   <label>Start Time</label>
                   <input className="form-control" type="time" value={form.startTime} onChange={e => handleChange("startTime", e.target.value)} required />
+                </div>
+                <div className="form-group">
+                  <label>End Date</label>
+                  <input className="form-control" type="date" value={form.endDate} onChange={e => handleChange("endDate", e.target.value)} required />
                 </div>
                 <div className="form-group">
                   <label>End Time</label>
@@ -804,7 +933,7 @@ function NewBooking({
               </div>
               <div className="form-group">
                 <label>Buffer Time</label>
-                <span style={{ fontSize: 12, color: "#6B7280" }}>Standard buffers applied: 0 min before, 30 min after.</span>
+                <span style={{ fontSize: 12, color: "#6B7280" }}>Standard buffers applied: 0 min before, 30 min after. Multi-day / overnight bookings are supported.</span>
               </div>
             </div>
 
@@ -817,8 +946,8 @@ function NewBooking({
             </div>
 
             <div className="form-actions">
-              <button type="button" className="btn btn-secondary" onClick={() => setForm({ asset: "", date: "", startTime: "", endTime: "", destination: "", purpose: "", notes: "" })}>Cancel</button>
-              <button type="submit" className="btn btn-primary" disabled={submitting || !demoUser}>{submitting ? "Submitting…" : "Create Booking"}</button>
+              <button type="button" className="btn btn-secondary" onClick={() => setForm({ asset: "", driver: "", startDate: "", endDate: "", startTime: "", endTime: "", destination: "", purpose: "", notes: "" })}>Cancel</button>
+              <button type="submit" className="btn btn-primary" disabled={submitting || !actor || !canWrite}>{submitting ? "Submitting…" : "Create Booking"}</button>
             </div>
           </form>
         </div>
@@ -843,9 +972,11 @@ function NewBooking({
 
 function MyBookings({
   bookings,
-  demoUser,
+  actor,
+  isLiveMode,
+  demoActor,
   users,
-  setDemoUser,
+  setDemoActor,
   onExport,
   onView,
   onCancel,
@@ -856,9 +987,11 @@ function MyBookings({
   onResetFilters,
 }: {
   bookings: Booking[];
-  demoUser: DemoUser | null;
-  users: DemoUser[];
-  setDemoUser: (e: DemoUser | null) => void;
+  actor: ActorContext | null;
+  isLiveMode: boolean;
+  demoActor: ResolvedUser | null;
+  users: ResolvedUser[];
+  setDemoActor: (u: ResolvedUser | null) => void;
   onExport: () => void;
   onView: (id: string) => void;
   onCancel: (id: string) => void;
@@ -887,12 +1020,12 @@ function MyBookings({
       <PageHeader
         eyebrow="My Bookings"
         title="My Bookings"
-        subtitle={demoUser ? `Bookings for ${demoUser.name}` : "Select a demo user from the topbar."}
+        subtitle={actor ? `Bookings for ${actor.name}` : (isLiveMode ? "Authenticated MyGeotab identity required." : "Select a demo user from the topbar.")}
       />
 
-      {!demoUser && (
+      {!actor && (
         <div className="notice error">
-          Select a demo user from the topbar to view their bookings.
+          {isLiveMode ? "Authenticated MyGeotab identity could not be verified." : "Select a demo user from the topbar to view their bookings."}
         </div>
       )}
 
@@ -919,13 +1052,14 @@ function MyBookings({
               <select
                 className="form-control"
                 style={{ width: "220px", maxWidth: "300px" }}
-                value={demoUser ? demoUser.id : ""}
+                value={demoActor ? demoActor.id : ""}
+                disabled={isLiveMode}
                 onChange={e => {
                   const emp = users.find(x => x.id === e.target.value) || null;
-                  setDemoUser(emp);
+                  setDemoActor(emp);
                 }}
               >
-                <option value="">Select demo user</option>
+                <option value="">{isLiveMode ? "Verified identity" : "Select demo user"}</option>
                 {users.map(emp => (
                   <option key={emp.id} value={emp.id}>{emp.name} ({emp.id})</option>
                 ))}
@@ -935,10 +1069,10 @@ function MyBookings({
           </div>
         </div>
         <div className="panel-body">
-          {!demoUser ? (
-            <EmptyState title="No user selected" message="Choose a demo user from the topbar selector." />
+          {!actor ? (
+            <EmptyState title="No identity selected" message={isLiveMode ? "Authenticated MyGeotab identity could not be verified." : "Choose a demo user from the topbar selector."} />
           ) : activeTab.length === 0 ? (
-            <EmptyState title="No bookings" message={`No ${tab} bookings found for ${demoUser?.name}.`} />
+            <EmptyState title="No bookings" message={`No ${tab} bookings found for ${actor?.name || "current user"}.`} />
           ) : (
             <div className="table-wrap">
               <table className="data-table">
@@ -1349,14 +1483,14 @@ function BookingReports({
 
 function NotificationCenter({
   notifications,
-  demoUser,
+  actor,
   onMarkAsRead,
   onMarkAllAsRead,
   onNotificationClick,
   unreadCount,
 }: {
   notifications: OpexNotification[];
-  demoUser: ResolvedUser | null;
+  actor: ActorContext | null;
   onMarkAsRead: (id: string) => void | Promise<void>;
   onMarkAllAsRead: () => void | Promise<void>;
   onNotificationClick: (id: string) => void | Promise<void>;
@@ -1394,7 +1528,7 @@ function NotificationCenter({
       <PageHeader
         eyebrow="Notifications"
         title="Notification Center"
-        subtitle={`${unreadCount} unread · notification history for ${demoUser?.name || "current user"}`}
+        subtitle={`${unreadCount} unread · notification history for ${actor?.name || "current user"}`}
       />
 
       <section className="panel">
@@ -1620,7 +1754,8 @@ export default function App() {
   const [bookings, setBookings] = useState<ResolvedBooking[]>([]);
   const [assets, setAssets] = useState<ResolvedAsset[]>([]);
   const [users, setUsers] = useState<ResolvedUser[]>([]);
-  const [demoUser, setDemoUser] = useState<ResolvedUser | null>(null);
+  const [demoActor, setDemoActor] = useState<ResolvedUser | null>(null);
+  const [identityState, setIdentityState] = useState<IdentityResolutionState>({ status: "unresolved", reason: "MyGeotab runtime not initialized." });
   const [loading, setLoading] = useState(false);
   const [message, setMessage] = useState<{ type: "success" | "error"; text: string } | null>(null);
   const [rejectingId, setRejectingId] = useState<string | null>(null);
@@ -1635,7 +1770,26 @@ export default function App() {
   });
   const [selectedBooking, setSelectedBooking] = useState<ResolvedBooking | null>(null);
   const [geotabApi, setGeotabApi] = useState<GeotabApi | null>(null);
-  const [mode, setMode] = useState<"DEMO" | "ADDIN_DATA">("DEMO");
+  const [mode, _setMode] = useState<AppMode>("DEMO");
+  const setMode = useCallback((next: AppMode) => {
+    if (!isKnownMode(next)) {
+      // Fail closed: ambiguous mode - keep current mode and do not clear/transition unsafely
+      return;
+    }
+    _setMode((prev) => {
+      if (prev === next) return prev;
+      // Clear stale actor/notification/pending state on every mode switch
+      setDemoActor(null);
+      setNotifications([]);
+      setUnreadCount(0);
+      setNotificationDropdownOpen(false);
+      setSelectedBooking(null);
+      setRejectingId(null);
+      setRejectReasonState({});
+      setMessage(null);
+      return next;
+    });
+  }, []);
   const [myGeotabError, setMyGeotabError] = useState<string | null>(null);
   const [toasts, setToasts] = useState<Toast[]>([]);
   const [unreadCount, setUnreadCount] = useState(0);
@@ -1649,13 +1803,12 @@ export default function App() {
   });
   const [addInIdInput, setAddInIdInput] = useState<string>("");
   const addInIdValid = isValidAddInId(addInId);
-  const [currentMyGeotabUser, setCurrentMyGeotabUser] = useState<{ userName?: string; database?: string; server?: string } | null>(null);
 
   // Refs to avoid stale closures in lifecycle subscription
   const geotabApiRef = useRef<GeotabApi | null>(null);
   const addInIdRef = useRef(addInId);
   const modeRef = useRef(mode);
-  const lastGetSessionApiRef = useRef<GeotabApi | null>(null);
+  const identityResolveSeq = useRef(0);
 
   // Keep refs in sync with state
   useEffect(() => {
@@ -1671,6 +1824,14 @@ export default function App() {
   const [notifications, setNotifications] = useState<OpexNotification[]>([]);
   const [notificationDropdownOpen, setNotificationDropdownOpen] = useState(false);
 
+  const isLiveMode = mode === "ADDIN_DATA";
+  const liveBlockedReason = getLiveBlockedReason(mode, identityState);
+  const verifiedPrincipal = identityState.status === "authenticated" ? identityState.principal : null;
+  const actor: ActorContext | null = isLiveMode
+    ? (verifiedPrincipal ? { id: verifiedPrincipal.id, name: verifiedPrincipal.name, roles: verifiedPrincipal.roles, kind: "authenticated" } : null)
+    : (demoActor ? { id: demoActor.id, name: demoActor.name, roles: demoActor.roles, kind: "demo" } : null);
+  const actorId = actor?.id ?? null;
+
   const onFilterChange = useCallback((key: string, value: string) => {
     setFilters(prev => ({ ...prev, [key]: value }));
   }, []);
@@ -1682,69 +1843,52 @@ export default function App() {
   const dashboardBookings = useMemo(() => filterBookings(bookings, filters), [bookings, filters]);
   const myBookingsData = useMemo(() => {
     let result = filterBookings(bookings, filters);
-    if (demoUser) result = result.filter(b => b.requester_id === demoUser.id);
+    if (actorId) result = result.filter(b => b.requester_id === actorId);
     return result;
-  }, [bookings, filters, demoUser]);
+  }, [bookings, filters, actorId]);
   const approvalBookings = useMemo(() => filterBookings(bookings, { ...filters, statusFilter: "PENDING_APPROVAL" }), [bookings, filters]);
   const availabilityBookings = useMemo(() => filterBookings(bookings, filters), [bookings, filters]);
   const reportsBookings = useMemo(() => filterBookings(bookings, filters), [bookings, filters]);
 
-  // ── Lifecycle bridge: recover API from MyGeotab initialize() even if
-  //    it fired before React registered its event listener ───────────
+  // ── Lifecycle bridge + deterministic authenticated identity resolution ──
   useEffect(() => {
     let mounted = true;
+    let seq = 0;
 
-    // Read stored lifecycle state from bridge (covers initialize() before mount)
-    const initialBridgeState = getLifecycleApi();
-    if (mounted && initialBridgeState.api && !geotabApiRef.current) {
-      setGeotabApi(initialBridgeState.api);
-      geotabApiRef.current = initialBridgeState.api;
-      lastGetSessionApiRef.current = initialBridgeState.api;
-      // Retrieve current MyGeotab user identity from Add-In context
-      try {
-        initialBridgeState.api.getSession?.((session) => {
-          if (mounted && session) {
-            setCurrentMyGeotabUser(session);
-            if (addInIdRef.current && modeRef.current === "DEMO") {
-              setMode("ADDIN_DATA");
-              modeRef.current = "ADDIN_DATA";
-              setProviderError(null);
-            }
-          }
-        });
-      } catch (err) {
-        // getSession() threw synchronously; API object is still valid, just session retrieval failed
-        const msg = err instanceof Error ? err.message : "Failed to retrieve MyGeotab session.";
-        setMyGeotabError(msg);
+    const applyApi = (api: GeotabApi | null) => {
+      if (!mounted) return;
+      setGeotabApi(api);
+      geotabApiRef.current = api;
+      if (!api) {
+        setIdentityState({ status: "unresolved", reason: "MyGeotab runtime not initialized." });
+        return;
       }
+      if (addInIdRef.current && modeRef.current === "DEMO") {
+        setMode("ADDIN_DATA");
+        modeRef.current = "ADDIN_DATA";
+        setProviderError(null);
+      }
+      const mySeq = ++seq;
+      identityResolveSeq.current = mySeq;
+      setIdentityState({ status: "loading" });
+      void resolveAuthenticatedPrincipal(api).then((resolved) => {
+        if (!mounted || identityResolveSeq.current !== mySeq) return;
+        setIdentityState(resolved);
+        if (resolved.status === "error") {
+          setMyGeotabError(resolved.reason);
+        }
+      });
+    };
+
+    const initialBridgeState = getLifecycleApi();
+    if (initialBridgeState.api) {
+      applyApi(initialBridgeState.api);
     }
 
-    // Subscribe to future lifecycle updates
     const unsubscribe = subscribeToLifecycle((bridgeState) => {
       if (!mounted) return;
-      if (bridgeState.api && bridgeState.api !== geotabApiRef.current) {
-        setGeotabApi(bridgeState.api);
-        geotabApiRef.current = bridgeState.api;
-        // Only call getSession once per unique API object
-        if (lastGetSessionApiRef.current !== bridgeState.api) {
-          lastGetSessionApiRef.current = bridgeState.api;
-          try {
-            bridgeState.api.getSession?.((session) => {
-              if (mounted && session) {
-                setCurrentMyGeotabUser(session);
-                if (addInIdRef.current && modeRef.current === "DEMO") {
-                  setMode("ADDIN_DATA");
-                  modeRef.current = "ADDIN_DATA";
-                  setProviderError(null);
-                }
-              }
-            });
-          } catch (err) {
-            // getSession() threw synchronously; API object is still valid, just session retrieval failed
-            const msg = err instanceof Error ? err.message : "Failed to retrieve MyGeotab session.";
-            setMyGeotabError(msg);
-          }
-        }
+      if (bridgeState.api !== geotabApiRef.current) {
+        applyApi(bridgeState.api);
       }
     });
 
@@ -1758,38 +1902,22 @@ export default function App() {
   useEffect(() => {
       let mounted = true;
 
-      // Determine effective provider: no silent fallback to DEMO when LIVE is intended
-      // ADDIN_DATA mode requires a valid MyGeotab API and AddInId; never fall back to DEMO
-      const effectiveMode = mode;
-      const provider: BookingDataProvider = effectiveMode === "ADDIN_DATA"
+      const effectiveMode = isKnownMode(mode) ? mode : "DEMO";
+      const dataProvider: BookingDataProvider = effectiveMode === "ADDIN_DATA"
         ? createAddInDataProvider(geotabApi, addInId)
         : bookingDataProvider;
 
       const loadMasterData = async () => {
         try {
-          const [assets, users, bookings] = await Promise.all([
-            provider.getAssets(),
-            provider.getUsers(),
-            provider.getBookings(),
+          const [a, u, b] = await Promise.all([
+            dataProvider.getAssets(),
+            dataProvider.getUsers(),
+            dataProvider.getBookings(),
           ]);
           if (mounted) {
-            setAssets(assets);
-            setUsers(users);
-            setBookings(bookings);
-            if (effectiveMode === "ADDIN_DATA" && currentMyGeotabUser) {
-              const matched = users.find(u => u.name === currentMyGeotabUser?.userName || u.id === currentMyGeotabUser?.userName);
-              if (matched && !demoUser) {
-                setDemoUser(matched);
-              }
-            }
-            if (demoUser && notificationEngine) {
-              notificationEngine.getNotificationsForUser(demoUser.id).then(ns => {
-                if (mounted) setNotifications(ns);
-              });
-              notificationEngine.getUnreadCount(demoUser.id).then(c => {
-                if (mounted) setUnreadCount(c);
-              });
-            }
+            setAssets(a);
+            setUsers(u);
+            setBookings(b);
             setProviderError(null);
           }
         } catch (e) {
@@ -1805,17 +1933,20 @@ export default function App() {
             }
             if (mode === "DEMO") {
               const fb = bookingDataProvider;
-              Promise.all([
-                fb.getAssets(),
-                fb.getUsers(),
-                fb.getBookings(),
-              ]).then(([a, u, b]) => {
-                if (mounted) {
-                  setAssets(a);
-                  setUsers(u);
-                  setBookings(b);
-                }
-              });
+              // Fail closed: demo fallback only to local non-live provider
+              if (!fb.isLive()) {
+                Promise.all([
+                  fb.getAssets(),
+                  fb.getUsers(),
+                  fb.getBookings(),
+                ]).then(([fa, fu, fbk]) => {
+                  if (mounted) {
+                    setAssets(fa);
+                    setUsers(fu);
+                    setBookings(fbk);
+                  }
+                });
+              }
             }
           }
         }
@@ -1826,7 +1957,20 @@ export default function App() {
       return () => {
         mounted = false;
       };
-    }, [mode, geotabApi, addInId, demoUser, currentMyGeotabUser]);
+    }, [mode, geotabApi, addInId]);
+
+  // Enforce separation and clear stale state on mode changes (defense in depth)
+  useEffect(() => {
+    if (mode === "ADDIN_DATA") {
+      setDemoActor(null);
+    }
+    setNotifications([]);
+    setUnreadCount(0);
+    setNotificationDropdownOpen(false);
+    setSelectedBooking(null);
+    setRejectingId(null);
+    setRejectReasonState({});
+  }, [mode]);
 
   // Keep the AddInId text input in sync with the persisted value
   useEffect(() => {
@@ -1834,11 +1978,14 @@ export default function App() {
   }, [addInId]);
 
   const provider = useMemo(() => {
-    // ADDIN_DATA mode requires a valid MyGeotab API and AddInId;
-    // never fall back to DEMO/localStorage when LIVE is intended
+    // Fail closed: only explicit DEMO uses local demo provider; only explicit ADDIN_DATA uses live provider.
     if (mode === "ADDIN_DATA") {
       return createAddInDataProvider(geotabApi, addInId);
     }
+    if (mode === "DEMO") {
+      return bookingDataProvider;
+    }
+    // Ambiguous mode: do not select live provider; return local provider but operations remain guarded/fail-closed elsewhere.
     return bookingDataProvider;
   }, [mode, geotabApi, addInId]);
 
@@ -1892,37 +2039,59 @@ export default function App() {
       const msg = e instanceof Error ? e.message : "Failed to reload data.";
       setMessage({ type: "error", text: msg });
       setProviderError(msg);
-      // No silent fallback: if ADDIN_DATA was intended but failed, surface the error
       if (mode === "ADDIN_DATA" && !geotabApi) {
         setProviderError("MyGeotab Add-In API is not available. ADDIN_DATA mode requires running inside a registered MyGeotab Add-In.");
       } else if (mode === "ADDIN_DATA" && !addInId) {
         setProviderError("Add-In Id is not configured. Enter your AddInId to use ADDIN_DATA storage.");
       }
     } finally {
-      // Refresh notifications after data load
-      if (demoUser && notificationEngine) {
-        notificationEngine.getNotificationsForUser(demoUser.id).then(ns => {
+      const currentActorId = getActorIdForMode(mode, identityState, demoActor?.id ?? null);
+      if (currentActorId && notificationEngine) {
+        notificationEngine.getNotificationsForUser(currentActorId).then(ns => {
           setNotifications(ns);
           setUnreadCount(ns.filter(n => !n.is_read).length);
         });
       }
     }
-  }, [provider, mode, geotabApi, addInId, demoUser, notificationEngine]);
+  }, [provider, mode, geotabApi, addInId, identityState, demoActor, notificationEngine]);
+
+  // Refresh notifications when actor context changes
+  useEffect(() => {
+    if (!actorId || !notificationEngine) return;
+    let mounted = true;
+    notificationEngine.getNotificationsForUser(actorId).then(ns => {
+      if (mounted) {
+        setNotifications(ns);
+        setUnreadCount(ns.filter(n => !n.is_read).length);
+      }
+    }).catch(() => {});
+    return () => { mounted = false; };
+  }, [actorId, notificationEngine]);
 
   const onResetDemoData = useCallback(async () => {
     setLoading(true);
     setMessage(null);
     try {
+      // Demo-only operation: explicit DEMO mode required, never executable in LIVE, never against live provider.
+      assertDemoOnlyOperation(mode, "Demo reset");
+      assertProviderNotLiveForDemoOperation(provider, "Demo reset");
       await provider.resetDemoData();
       const refreshed = await provider.getBookings();
       setBookings(refreshed);
+      // Clear stale pending/notification state after demo reset
+      setNotifications([]);
+      setUnreadCount(0);
+      setNotificationDropdownOpen(false);
+      setSelectedBooking(null);
+      setRejectingId(null);
+      setRejectReasonState({});
       setLoading(false);
       setMessage({ type: "success", text: "Demo data reset to initial state." });
     } catch (e) {
       setLoading(false);
       setMessage({ type: "error", text: e instanceof Error ? e.message : "Failed to reset demo data." });
     }
-  }, [provider]);
+  }, [mode, provider]);
 
   const onSaveAddInId = useCallback(async () => {
     const trimmed = addInIdInput.trim();
@@ -1953,76 +2122,170 @@ export default function App() {
   const onCreateBooking = useCallback(async (input: {
     assetId: string; startAt: string; endAt: string; destination: string;
     purpose: string; notes: string;
+    driverId?: string | null; driverName?: string | null;
   }) => {
-    if (!demoUser) return;
+    const currentActorId = getActorIdForMode(mode, identityState, demoActor?.id ?? null);
+    if (!currentActorId) {
+      setMessage({ type: "error", text: isLiveMode ? (liveBlockedReason || "Authenticated MyGeotab identity could not be verified.") : "Select a demo user to create bookings." });
+      return;
+    }
+    if (!canPerformLiveWrite(mode, identityState)) {
+      setMessage({ type: "error", text: liveBlockedReason || "Authenticated MyGeotab identity could not be verified." });
+      return;
+    }
     try {
       const created = await provider.createBooking({
         deviceId: input.assetId,
-        requesterUserId: demoUser.id,
+        requesterUserId: currentActorId,
         requestedClass: "PASSENGER",
         startAt: input.startAt,
         endAt: input.endAt,
         purpose: input.purpose,
         destination: input.destination,
         passengerCount: null,
+        driverId: input.driverId ?? null,
+        driverName: input.driverName ?? null,
       });
       const refreshed = await provider.getBookings();
       setBookings(refreshed);
-      // Notify approvers about new booking request
-      if (notificationEngine) {
-        const approvers = await provider.getApprovers();
-        await notificationEngine.onBookingCreated(created, approvers);
-        // Refresh notifications for current user
-        const ns = await notificationEngine.getNotificationsForUser(demoUser.id);
-        setNotifications(ns);
-        setUnreadCount(ns.filter(n => !n.is_read).length);
+
+      // Audit: BOOKING_CREATED (post-persist). Do not claim complete success if audit fails; do not re-create booking.
+      const auditCreated = await emitAuditEvent({
+        mode,
+        provider: provider as any,
+        entityId: created.id,
+        action: "BOOKING_CREATED",
+        actorUserId: currentActorId,
+        previousStatus: null,
+        newStatus: "PENDING_APPROVAL",
+        previous: null,
+        next: snapshotBooking(created),
+        metadata: { source: "ui.createBooking" },
+        idempotencyKey: `${mode}:${created.id}:BOOKING_CREATED`,
+      });
+      if (!auditCreated.ok) {
+        setMessage({ type: "error", text: `Booking #${created.id.slice(-4)} created, but audit persistence failed: ${auditCreated.error}. Booking was not re-created; audit may require recovery.` });
+      } else {
+        setMessage({ type: "success", text: `Booking #${created.id.slice(-4)} created successfully as PENDING_APPROVAL.` });
       }
-      setMessage({ type: "success", text: `Booking #${created.id.slice(-4)} created successfully as PENDING_APPROVAL.` });
+
+      if (notificationEngine) {
+        try {
+          const approvers = await provider.getApprovers();
+          await notificationEngine.onBookingCreated(created, approvers);
+          const ns = await notificationEngine.getNotificationsForUser(currentActorId);
+          setNotifications(ns);
+          setUnreadCount(ns.filter(n => !n.is_read).length);
+        } catch (notifyError) {
+          setMessage({
+            type: "error",
+            text: `Booking #${created.id.slice(-4)} created, but notification delivery failed: ${notifyError instanceof Error ? notifyError.message : "Unknown error"}.${auditCreated.ok ? "" : " Audit persistence also failed."}`,
+          });
+        }
+      }
     } catch (e) {
       setMessage({ type: "error", text: e instanceof Error ? e.message : "Failed to create booking." });
     }
-  }, [demoUser, provider, notificationEngine]);
+  }, [mode, identityState, demoActor, isLiveMode, liveBlockedReason, provider, notificationEngine]);
 
   const onApprove = useCallback(async (id: string) => {
-    const before = bookings.find(b => b.id === id);
-    await updateBookingStatus(id, "APPROVED", demoUser?.id ?? undefined);
+    if (!canPerformLiveWrite(mode, identityState)) {
+      setMessage({ type: "error", text: liveBlockedReason || "Authenticated MyGeotab identity could not be verified." });
+      return;
+    }
+    const approverActor = isLiveMode ? (verifiedPrincipal ? { id: verifiedPrincipal.id, name: verifiedPrincipal.name, roles: verifiedPrincipal.roles } : null) : (demoActor ? { id: demoActor.id, name: demoActor.name, roles: demoActor.roles } : null);
+    const approverId = getActorIdForMode(mode, identityState, demoActor?.id ?? null) ?? undefined;
+    const previous = bookings.find(b => b.id === id) || null;
+    try {
+      await updateBookingStatus(id, "APPROVED", approverId);
+    } catch (e) {
+      setMessage({ type: "error", text: e instanceof Error ? e.message : "Failed to approve booking." });
+      return;
+    }
     const updated = await provider.getBookings();
     setBookings(updated);
-    // Notify requester about approval
-    if (notificationEngine) {
-      const booking = updated.find(b => b.id === id);
-      const approver = demoUser;
-      if (booking && notificationEngine) {
-        await notificationEngine.onBookingApproved(booking, approver);
-        const ns = await notificationEngine.getNotificationsForUser(demoUser!.id);
+    const booking = updated.find(b => b.id === id) || null;
+    const audit = await emitAuditEvent({
+      mode,
+      provider: provider as any,
+      entityId: id,
+      action: "BOOKING_APPROVED",
+      actorUserId: approverId || "",
+      previousStatus: previous?.status ?? null,
+      newStatus: "APPROVED",
+      previous: snapshotBooking(previous),
+      next: snapshotBooking(booking),
+      metadata: { approverId: approverId ?? null },
+      idempotencyKey: `${mode}:${id}:BOOKING_APPROVED:${previous?.status ?? ""}:APPROVED:${approverId ?? ""}`,
+    });
+    if (!audit.ok) {
+      setMessage({ type: "error", text: `Booking #${id.slice(-4)} approved, but audit persistence failed: ${audit.error}. Booking was not reverted; audit may require recovery.` });
+    }
+    if (notificationEngine && booking) {
+      try {
+        await notificationEngine.onBookingApproved(booking, approverActor);
+      } catch { /* notification failure reported elsewhere where applicable */ }
+      const notifUserId = getActorIdForMode(mode, identityState, demoActor?.id ?? null);
+      if (notifUserId) {
+        const ns = await notificationEngine.getNotificationsForUser(notifUserId);
         setNotifications(ns);
         setUnreadCount(ns.filter(n => !n.is_read).length);
       }
     }
-  }, [updateBookingStatus, demoUser, provider, bookings, notificationEngine]);
+  }, [mode, identityState, isLiveMode, liveBlockedReason, verifiedPrincipal, demoActor, updateBookingStatus, provider, notificationEngine]);
 
   const onReject = useCallback((id: string) => {
     setRejectingId(id);
   }, []);
 
   const onConfirmReject = useCallback(async (id: string) => {
-    const before = bookings.find(b => b.id === id);
-    await updateBookingStatus(id, "REJECTED", demoUser?.id ?? undefined, rejectReason[id] ?? undefined);
+    if (!canPerformLiveWrite(mode, identityState)) {
+      setMessage({ type: "error", text: liveBlockedReason || "Authenticated MyGeotab identity could not be verified." });
+      setRejectingId(null);
+      return;
+    }
+    const approverActor = isLiveMode ? (verifiedPrincipal ? { id: verifiedPrincipal.id, name: verifiedPrincipal.name, roles: verifiedPrincipal.roles } : null) : (demoActor ? { id: demoActor.id, name: demoActor.name, roles: demoActor.roles } : null);
+    const approverId = getActorIdForMode(mode, identityState, demoActor?.id ?? null) ?? undefined;
+    const previous = bookings.find(b => b.id === id) || null;
+    const reason = rejectReason[id] ?? undefined;
+    try {
+      await updateBookingStatus(id, "REJECTED", approverId, reason);
+    } catch (e) {
+      setMessage({ type: "error", text: e instanceof Error ? e.message : "Failed to reject booking." });
+      return;
+    }
     const updated = await provider.getBookings();
     setBookings(updated);
-    // Notify requester about rejection
-    if (notificationEngine) {
-      const booking = updated.find(b => b.id === id);
-      const approver = demoUser;
-      if (booking && notificationEngine) {
-        await notificationEngine.onBookingRejected(booking, approver, rejectReason[id] ?? undefined);
-        const ns = await notificationEngine.getNotificationsForUser(demoUser!.id);
+    const booking = updated.find(b => b.id === id) || null;
+    const audit = await emitAuditEvent({
+      mode,
+      provider: provider as any,
+      entityId: id,
+      action: "BOOKING_REJECTED",
+      actorUserId: approverId || "",
+      previousStatus: previous?.status ?? null,
+      newStatus: "REJECTED",
+      previous: snapshotBooking(previous),
+      next: snapshotBooking(booking),
+      metadata: { approverId: approverId ?? null, reason: reason ?? null },
+      idempotencyKey: `${mode}:${id}:BOOKING_REJECTED:${previous?.status ?? ""}:REJECTED:${approverId ?? ""}`,
+    });
+    if (!audit.ok) {
+      setMessage({ type: "error", text: `Booking #${id.slice(-4)} rejected, but audit persistence failed: ${audit.error}. Booking was not reverted; audit may require recovery.` });
+    }
+    if (notificationEngine && booking) {
+      try {
+        await notificationEngine.onBookingRejected(booking, approverActor, reason);
+      } catch { }
+      const notifUserId = getActorIdForMode(mode, identityState, demoActor?.id ?? null);
+      if (notifUserId) {
+        const ns = await notificationEngine.getNotificationsForUser(notifUserId);
         setNotifications(ns);
         setUnreadCount(ns.filter(n => !n.is_read).length);
       }
     }
     setRejectingId(null);
-  }, [updateBookingStatus, demoUser, provider, bookings, rejectReason, notificationEngine]);
+  }, [mode, identityState, isLiveMode, liveBlockedReason, verifiedPrincipal, demoActor, updateBookingStatus, provider, rejectReason, notificationEngine]);
 
   const onCancelReject = useCallback(() => {
     setRejectingId(null);
@@ -2031,33 +2294,122 @@ export default function App() {
   const onAssign = useCallback(async (id: string) => {
     const b = bookings.find(x => x.id === id);
     if (!b || b.status !== "APPROVED") return;
-    await updateBookingStatus(id, "ASSIGNED");
+    if (!canPerformLiveWrite(mode, identityState)) {
+      setMessage({ type: "error", text: liveBlockedReason || "Authenticated MyGeotab identity could not be verified." });
+      return;
+    }
+    const previous = bookings.find(x => x.id === id) || null;
+    const actorIdForOp = getActorIdForMode(mode, identityState, demoActor?.id ?? null) ?? undefined;
+    try {
+      await updateBookingStatus(id, "ASSIGNED", actorIdForOp);
+    } catch (e) {
+      setMessage({ type: "error", text: e instanceof Error ? e.message : "Failed to assign booking." });
+      return;
+    }
     const updated = await provider.getBookings();
     setBookings(updated);
-    // Notify requester about vehicle assignment
-    if (notificationEngine) {
-      const booking = updated.find(b => b.id === id);
-      const assigner = demoUser;
-      if (booking && notificationEngine) {
+    const booking = updated.find(x => x.id === id) || null;
+    const audit = await emitAuditEvent({
+      mode,
+      provider: provider as any,
+      entityId: id,
+      action: "VEHICLE_ASSIGNED",
+      actorUserId: actorIdForOp || "",
+      previousStatus: previous?.status ?? null,
+      newStatus: "ASSIGNED",
+      previous: snapshotBooking(previous),
+      next: snapshotBooking(booking),
+      metadata: { assignedBy: actorIdForOp ?? null },
+      idempotencyKey: `${mode}:${id}:VEHICLE_ASSIGNED:${previous?.status ?? ""}:ASSIGNED:${actorIdForOp ?? ""}`,
+    });
+    if (!audit.ok) {
+      setMessage({ type: "error", text: `Booking #${id.slice(-4)} assigned, but audit persistence failed: ${audit.error}. Booking was not reverted; audit may require recovery.` });
+    }
+    if (notificationEngine && booking) {
+      const assigner = isLiveMode ? (verifiedPrincipal ? { id: verifiedPrincipal.id, name: verifiedPrincipal.name, roles: verifiedPrincipal.roles } : null) : (demoActor ? { id: demoActor.id, name: demoActor.name, roles: demoActor.roles } : null);
+      try {
         await notificationEngine.onVehicleAssigned(booking, assigner);
-        const ns = await notificationEngine.getNotificationsForUser(demoUser!.id);
+      } catch { }
+      const notifUserId = getActorIdForMode(mode, identityState, demoActor?.id ?? null);
+      if (notifUserId) {
+        const ns = await notificationEngine.getNotificationsForUser(notifUserId);
         setNotifications(ns);
         setUnreadCount(ns.filter(n => !n.is_read).length);
       }
     }
-  }, [bookings, updateBookingStatus, demoUser, provider, notificationEngine]);
+  }, [bookings, mode, identityState, isLiveMode, liveBlockedReason, verifiedPrincipal, demoActor, updateBookingStatus, provider, notificationEngine]);
 
   const onComplete = useCallback(async (id: string) => {
     const b = bookings.find(x => x.id === id);
     if (!b || b.status !== "ASSIGNED") return;
-    await updateBookingStatus(id, "COMPLETED");
-  }, [bookings, updateBookingStatus]);
+    if (!canPerformLiveWrite(mode, identityState)) {
+      setMessage({ type: "error", text: liveBlockedReason || "Authenticated MyGeotab identity could not be verified." });
+      return;
+    }
+    const actorIdForOp = getActorIdForMode(mode, identityState, demoActor?.id ?? null) ?? "";
+    const previous = b;
+    try {
+      await updateBookingStatus(id, "COMPLETED", actorIdForOp || undefined);
+    } catch (e) {
+      setMessage({ type: "error", text: e instanceof Error ? e.message : "Failed to complete booking." });
+      return;
+    }
+    const updated = await provider.getBookings();
+    setBookings(updated);
+    const booking = updated.find(x => x.id === id) || null;
+    const audit = await emitAuditEvent({
+      mode,
+      provider: provider as any,
+      entityId: id,
+      action: "BOOKING_COMPLETED",
+      actorUserId: actorIdForOp,
+      previousStatus: previous.status,
+      newStatus: "COMPLETED",
+      previous: snapshotBooking(previous),
+      next: snapshotBooking(booking),
+      metadata: {},
+      idempotencyKey: `${mode}:${id}:BOOKING_COMPLETED:${previous.status}:COMPLETED:${actorIdForOp}`,
+    });
+    if (!audit.ok) {
+      setMessage({ type: "error", text: `Booking #${id.slice(-4)} completed, but audit persistence failed: ${audit.error}. Booking was not reverted; audit may require recovery.` });
+    }
+  }, [bookings, mode, identityState, liveBlockedReason, demoActor, updateBookingStatus, provider]);
 
   const onCancel = useCallback(async (id: string) => {
     const b = bookings.find(x => x.id === id);
     if (!b || !["PENDING_APPROVAL", "APPROVED", "ASSIGNED"].includes(b.status)) return;
-    await updateBookingStatus(id, "CANCELLED");
-  }, [bookings, updateBookingStatus]);
+    if (!canPerformLiveWrite(mode, identityState)) {
+      setMessage({ type: "error", text: liveBlockedReason || "Authenticated MyGeotab identity could not be verified." });
+      return;
+    }
+    const actorIdForOp = getActorIdForMode(mode, identityState, demoActor?.id ?? null) ?? "";
+    const previous = b;
+    try {
+      await updateBookingStatus(id, "CANCELLED", actorIdForOp || undefined);
+    } catch (e) {
+      setMessage({ type: "error", text: e instanceof Error ? e.message : "Failed to cancel booking." });
+      return;
+    }
+    const updated = await provider.getBookings();
+    setBookings(updated);
+    const booking = updated.find(x => x.id === id) || null;
+    const audit = await emitAuditEvent({
+      mode,
+      provider: provider as any,
+      entityId: id,
+      action: "BOOKING_CANCELLED",
+      actorUserId: actorIdForOp,
+      previousStatus: previous.status,
+      newStatus: "CANCELLED",
+      previous: snapshotBooking(previous),
+      next: snapshotBooking(booking),
+      metadata: {},
+      idempotencyKey: `${mode}:${id}:BOOKING_CANCELLED:${previous.status}:CANCELLED:${actorIdForOp}`,
+    });
+    if (!audit.ok) {
+      setMessage({ type: "error", text: `Booking #${id.slice(-4)} cancelled, but audit persistence failed: ${audit.error}. Booking was not reverted; audit may require recovery.` });
+    }
+  }, [bookings, mode, identityState, liveBlockedReason, demoActor, updateBookingStatus, provider]);
 
   const setRejectReason = useCallback((id: string, reason: string) => {
     setRejectReasonState(prev => ({ ...prev, [id]: reason }));
@@ -2088,8 +2440,8 @@ export default function App() {
       Destination: b.destination || "",
       "Booking Status": b.status,
     }));
-    exportCSV(data, `opex-vbm-mybookings-${demoUser?.name || "all"}-${new Date().toISOString().slice(0,10)}.csv`);
-  }, [myBookingsData, demoUser]);
+    exportCSV(data, `opex-vbm-mybookings-${actor?.name || "all"}-${new Date().toISOString().slice(0,10)}.csv`);
+  }, [myBookingsData, actor]);
 
   const onExportApprovals = useCallback(() => {
     const data = approvalBookings.map(b => ({
@@ -2143,19 +2495,23 @@ export default function App() {
         <NewBooking
           assets={assets}
           bookings={bookings}
-          demoUser={demoUser}
+          actor={actor}
+          canWrite={canPerformLiveWrite(mode, identityState)}
+          blockedReason={isLiveMode ? liveBlockedReason : (!actor ? "Select a demo user to create bookings." : null)}
           onCreateBooking={onCreateBooking}
-          submitting={loading}
           addToast={pushToastCb}
           navigateToMyBookings={() => navigateTo("My Bookings")}
+          users={users}
         />
       );
       case "My Bookings": return (
         <MyBookings
           bookings={myBookingsData}
-          demoUser={demoUser}
+          actor={actor}
+          isLiveMode={isLiveMode}
+          demoActor={demoActor}
           users={users}
-          setDemoUser={setDemoUser}
+          setDemoActor={setDemoActor}
           onExport={onExportMyBookings}
           onView={id => setSelectedBooking(myBookingsData.find(b => b.id === id) || null)}
           onCancel={onCancel}
@@ -2189,20 +2545,20 @@ export default function App() {
       case "Notifications": return (
         <NotificationCenter
           notifications={notifications}
-          demoUser={demoUser}
+          actor={actor}
           unreadCount={unreadCount}
           onMarkAsRead={async (id: string) => {
-            if (notificationEngine) {
+            if (notificationEngine && actorId) {
               await notificationEngine.markAsRead(id);
-              const ns = await notificationEngine.getNotificationsForUser(demoUser!.id);
+              const ns = await notificationEngine.getNotificationsForUser(actorId);
               setNotifications(ns);
               setUnreadCount(ns.filter(n => !n.is_read).length);
             }
           }}
           onMarkAllAsRead={async () => {
-            if (notificationEngine && demoUser) {
-              await notificationEngine.markAllAsRead(demoUser.id);
-              const ns = await notificationEngine.getNotificationsForUser(demoUser.id);
+            if (notificationEngine && actorId) {
+              await notificationEngine.markAllAsRead(actorId);
+              const ns = await notificationEngine.getNotificationsForUser(actorId);
               setNotifications(ns);
               setUnreadCount(0);
             }
@@ -2212,9 +2568,9 @@ export default function App() {
             if (n?.related_booking_id) {
               setSelectedBooking(bookings.find(b => b.id === n.related_booking_id) || null);
               setActive("My Bookings");
-              if (notificationEngine) {
+              if (notificationEngine && actorId) {
                 await notificationEngine.markAsRead(id);
-                const ns = await notificationEngine.getNotificationsForUser(demoUser!.id);
+                const ns = await notificationEngine.getNotificationsForUser(actorId);
                 setNotifications(ns);
                 setUnreadCount(ns.filter(x => !x.is_read).length);
               }
@@ -2318,31 +2674,37 @@ export default function App() {
               ) : null}
             </div>
 
-            {/* Current MyGeotab user from authenticated session */}
-            {currentMyGeotabUser && (
+            {/* Authenticated MyGeotab identity (verified principal only) */}
+            {isLiveMode && (
               <div style={{ display: "flex", alignItems: "center", gap: 8, paddingLeft: 12, borderLeft: "1px solid var(--border)" }}>
                 <div>
-                  <div style={{ fontSize: "var(--text-xs)", color: "#6B7280", textTransform: "uppercase", letterSpacing: "0.05em" }}>MyGeotab User</div>
-                  <div style={{ fontSize: 12, fontWeight: 600 }}>{currentMyGeotabUser.userName || "Unknown"}</div>
-                  <div style={{ fontSize: 10, color: "#6B7280" }}>{currentMyGeotabUser.database || ""}{currentMyGeotabUser.server ? ` · ${currentMyGeotabUser.server}` : ""}</div>
+                  <div style={{ fontSize: "var(--text-xs)", color: "#6B7280", textTransform: "uppercase", letterSpacing: "0.05em" }}>MyGeotab Identity</div>
+                  {identityState.status === "authenticated" && verifiedPrincipal ? (
+                    <>
+                      <div style={{ fontSize: 12, fontWeight: 600 }}>{verifiedPrincipal.name}</div>
+                      <div style={{ fontSize: 10, color: "#6B7280" }}>{verifiedPrincipal.id}{identityState.session.database ? ` · ${identityState.session.database}` : ""}</div>
+                    </>
+                  ) : (
+                    <div style={{ fontSize: 11, color: "#EF4444" }}>{identityState.status === "loading" ? "Resolving…" : (liveBlockedReason || "Unverified")}</div>
+                  )}
                 </div>
               </div>
             )}
 
-            {/* Demo User select (DEMO mode only) */}
-            {mode === "DEMO" && (
+            {/* Demo actor select (DEMO mode only; never used in LIVE) */}
+            {!isLiveMode && (
               <div style={{ display: "flex", alignItems: "center", gap: 8, paddingLeft: 12, borderLeft: "1px solid var(--border)" }}>
                 <label style={{ fontSize: "var(--text-xs)", fontWeight: 600, color: "#6B7280", textTransform: "uppercase", letterSpacing: "0.05em" }}>Demo User</label>
                 <select
                   className="form-control"
                   style={{ width: "180px", fontSize: "var(--text-sm)" }}
-                  value={demoUser ? demoUser.id : ""}
+                  value={demoActor ? demoActor.id : ""}
                   onChange={e => {
                     const emp = users.find(x => x.id === e.target.value) || null;
-                    setDemoUser(emp);
+                    setDemoActor(emp);
                   }}
                 >
-                  <option value="">Select user</option>
+                  <option value="">Select demo user</option>
                   {users.map(u => (
                     <option key={u.id} value={u.id}>{u.name} ({u.id})</option>
                   ))}
@@ -2374,17 +2736,17 @@ export default function App() {
                   notifications={notifications}
                   unreadCount={unreadCount}
                   onMarkAsRead={async (id: string) => {
-                    if (notificationEngine) {
+                    if (notificationEngine && actorId) {
                       await notificationEngine.markAsRead(id);
-                      const ns = await notificationEngine.getNotificationsForUser(demoUser!.id);
+                      const ns = await notificationEngine.getNotificationsForUser(actorId);
                       setNotifications(ns);
                       setUnreadCount(ns.filter(n => !n.is_read).length);
                     }
                   }}
                   onMarkAllAsRead={async () => {
-                    if (notificationEngine && demoUser) {
-                      await notificationEngine.markAllAsRead(demoUser.id);
-                      const ns = await notificationEngine.getNotificationsForUser(demoUser.id);
+                    if (notificationEngine && actorId) {
+                      await notificationEngine.markAllAsRead(actorId);
+                      const ns = await notificationEngine.getNotificationsForUser(actorId);
                       setNotifications(ns);
                       setUnreadCount(0);
                     }
@@ -2397,30 +2759,26 @@ export default function App() {
                       setSelectedBooking(bookings.find(b => b.id === n.related_booking_id) || null);
                       setActive("My Bookings");
                       setNotificationDropdownOpen(false);
-                      // Mark as read
-                      if (notificationEngine) {
+                      if (notificationEngine && actorId) {
                         await notificationEngine.markAsRead(id);
-                        const ns = await notificationEngine.getNotificationsForUser(demoUser!.id);
+                        const ns = await notificationEngine.getNotificationsForUser(actorId);
                         setNotifications(ns);
                         setUnreadCount(ns.filter(x => !x.is_read).length);
                       }
                     }
                   }}
-                  demoUserId={demoUser?.id ?? ""}
                 />
               )}
             </div>
 
             <div className="user-badge">
-              {demoUser ? (
-                <>
-                  <div>
-                    <div style={{ fontSize: 12 }}>{demoUser.name}</div>
-                    <div style={{ fontSize: 10, color: "#6B7280" }}>{demoUser.roles.join(", ")}</div>
-                  </div>
-                </>
+              {actor ? (
+                <div>
+                  <div style={{ fontSize: 12 }}>{actor.name}</div>
+                  <div style={{ fontSize: 10, color: "#6B7280" }}>{actor.kind === "authenticated" ? "Verified MyGeotab" : "Demo"} · {actor.roles.join(", ")}</div>
+                </div>
               ) : (
-                <div style={{ fontSize: 11, color: "#9CA3AF" }}>No user</div>
+                <div style={{ fontSize: 11, color: isLiveMode ? "#EF4444" : "#9CA3AF" }}>{isLiveMode ? "Identity unverified" : "No demo user"}</div>
               )}
             </div>
           </div>

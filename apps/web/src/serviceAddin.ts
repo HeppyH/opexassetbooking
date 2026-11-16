@@ -44,6 +44,9 @@ type OpexNotification = {
   updated_at: string;
 };
 
+type AddInDataDetails = string | Record<string, unknown>;
+type AddInDataRecord = { addInId?: string; details?: AddInDataDetails; id?: string };
+
 /*───────────────────── Constants ─────────────────────*/
 
 const ADDIN_ID_KEY = "opex-vbm-addin-id";
@@ -58,9 +61,9 @@ const RETRY_BACKOFF_MS = 60000; // 1 minute between retries
 
 /*───────────────────── Helpers ─────────────────────*/
 
-function deserializeNotification(details: string): OpexNotification | null {
+function deserializeNotification(details: AddInDataDetails): OpexNotification | null {
   try {
-    return JSON.parse(details) as OpexNotification;
+    return (typeof details === "string" ? JSON.parse(details) : details) as OpexNotification;
   } catch {
     return null;
   }
@@ -158,7 +161,7 @@ async function deliverPendingNotifications(service: ServiceAddIn): Promise<void>
   diagLog("Service Add-In AddInId resolved", { addInIdValid: isValidAddInIdLocal(addInId) });
 
   // Retrieve pending notifications from AddInData
-  const records = await apiCall<{ addInId?: string; details?: string; id?: string }[]>(
+  const records = await apiCall<AddInDataRecord[]>(
     service,
     "Get",
     {
@@ -227,7 +230,7 @@ async function deliverPendingNotifications(service: ServiceAddIn): Promise<void>
         entity: {
           addInId,
           id: record.id,
-          details: JSON.stringify(n),
+          details: n,
           groups: [{ id: NOTIFICATION_GROUP_ID }],
         },
       }

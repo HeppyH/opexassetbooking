@@ -114,12 +114,15 @@ export interface ResolvedBooking {
   version: number;
   created_at: string;
   updated_at: string;
+  driver_id: string | null;
+  driver_name: string | null;
 }
 
 export interface ResolvedUser {
   id: string;
   name: string;
   roles: string[];
+  companyGroups?: string[];
 }
 
 /*───────────────────── Data Provider Interface ─────────────────────*/
@@ -139,6 +142,8 @@ export interface BookingDataProvider {
     purpose: string;
     destination: string | null;
     passengerCount: number | null;
+    driverId?: string | null;
+    driverName?: string | null;
   }): Promise<ResolvedBooking>;
   updateBookingStatus(id: string, status: string, approverId?: string, approvalRemarks?: string): Promise<void>;
   deleteBooking(id: string): Promise<void>;
