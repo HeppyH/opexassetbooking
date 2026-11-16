@@ -1,10 +1,11 @@
-import { useState, useCallback, useEffect, useMemo } from "react";
+import { useState, useCallback, useEffect, useMemo, useRef } from "react";
 import { bookingDataProvider } from "../data/dataProvider";
 import type { ResolvedAsset, ResolvedBooking, ResolvedUser, BookingDataProvider, OpexNotification, NotificationType, NotificationDataProvider } from "../data/types";
 import { createAddInDataProvider, AddInDataBookingDataProvider } from "../data/addinDataProvider";
 import { createNotificationEngine, NotificationEngine } from "../data/notificationService";
 import { useAutoRefresh } from "./autoRefresh";
 import { DEFAULT_ADDIN_ID, ADDIN_ID_STORAGE_KEY, resolveAddInId, isValidAddInId } from "../config/addinId";
+import { getLifecycleApi, subscribeToLifecycle, type LifecycleBridgeState } from "../config/lifecycleBridge";
 
 const TENANT = import.meta.env.VITE_GEOTAB_DATABASE || "opex_trial";
 
@@ -1645,6 +1646,23 @@ export default function App() {
   const [addInIdInput, setAddInIdInput] = useState<string>("");
   const addInIdValid = isValidAddInId(addInId);
   const [currentMyGeotabUser, setCurrentMyGeotabUser] = useState<{ userName?: string; database?: string; server?: string } | null>(null);
+
+  // Refs to avoid stale closures in lifecycle subscription
+  const geotabApiRef = useRef<GeotabApi | null>(null);
+  const addInIdRef = useRef(addInId);
+  const modeRef = useRef(mode);
+  const lastGetSessionApiRef = useRef<GeotabApi | null>(null);
+
+  // Keep refs in sync with state
+  useEffect(() => {
+    geotabApiRef.current = geotabApi;
+  }, [geotabApi]);
+  useEffect(() => {
+    addInIdRef.current = addInId;
+  }, [addInId]);
+  useEffect(() => {
+    modeRef.current = mode;
+  }, [mode]);
   const [providerError, setProviderError] = useState<string | null>(null);
   const [notifications, setNotifications] = useState<OpexNotification[]>([]);
   const [notificationDropdownOpen, setNotificationDropdownOpen] = useState(false);
@@ -1667,117 +1685,144 @@ export default function App() {
   const availabilityBookings = useMemo(() => filterBookings(bookings, filters), [bookings, filters]);
   const reportsBookings = useMemo(() => filterBookings(bookings, filters), [bookings, filters]);
 
+  // ── Lifecycle bridge: recover API from MyGeotab initialize() even if
+  //    it fired before React registered its event listener ───────────
   useEffect(() => {
     let mounted = true;
 
-    const onInitialize = (event: Event) => {
-      const ce = event as CustomEvent<{ api: GeotabApi | null; state: unknown }>;
-      if (ce.detail?.api) {
-        setGeotabApi(ce.detail.api);
-        document.documentElement.dataset.opexVbm = "initialized";
-        // Retrieve current MyGeotab user identity from Add-In context
-        ce.detail.api.getSession?.((session) => {
+    // Read stored lifecycle state from bridge (covers initialize() before mount)
+    const initialBridgeState = getLifecycleApi();
+    if (mounted && initialBridgeState.api && !geotabApiRef.current) {
+      setGeotabApi(initialBridgeState.api);
+      geotabApiRef.current = initialBridgeState.api;
+      lastGetSessionApiRef.current = initialBridgeState.api;
+      // Retrieve current MyGeotab user identity from Add-In context
+      try {
+        initialBridgeState.api.getSession?.((session) => {
           if (mounted && session) {
             setCurrentMyGeotabUser(session);
-            // Auto-activate ADDIN_DATA when running inside MyGeotab with addInId configured
-            if (addInId && mode === "DEMO") {
+            if (addInIdRef.current && modeRef.current === "DEMO") {
               setMode("ADDIN_DATA");
+              modeRef.current = "ADDIN_DATA";
               setProviderError(null);
             }
           }
         });
+      } catch (err) {
+        // getSession() threw synchronously; API object is still valid, just session retrieval failed
+        const msg = err instanceof Error ? err.message : "Failed to retrieve MyGeotab session.";
+        setMyGeotabError(msg);
       }
-    };
+    }
 
-    const onFocus = (event: Event) => {
-      const ce = event as CustomEvent<{ api: GeotabApi | null; state: unknown }>;
-      if (ce.detail?.api) {
-        setGeotabApi(ce.detail.api);
-        // Re-check auto-activation on focus (addInId may have been configured meanwhile)
-        if (addInId && mode === "DEMO") {
-          setMode("ADDIN_DATA");
-          setProviderError(null);
-        }
-      }
-    };
-
-    window.addEventListener("opex-vbm:initialize", onInitialize as EventListener);
-    window.addEventListener("opex-vbm:focus", onFocus as EventListener);
-
-    // Determine effective provider: no silent fallback to DEMO when LIVE is intended
-    const effectiveMode = mode === "ADDIN_DATA" && !geotabApi ? "DEMO" : mode;
-    const provider: BookingDataProvider = effectiveMode === "ADDIN_DATA"
-      ? createAddInDataProvider(geotabApi, addInId)
-      : bookingDataProvider;
-
-    const loadMasterData = async () => {
-      try {
-        const [assets, users, bookings] = await Promise.all([
-          provider.getAssets(),
-          provider.getUsers(),
-          provider.getBookings(),
-        ]);
-        if (mounted) {
-          setAssets(assets);
-          setUsers(users);
-          setBookings(bookings);
-          // In ADDIN_DATA mode, use authenticated MyGeotab user as current user
-          if (effectiveMode === "ADDIN_DATA" && currentMyGeotabUser) {
-            const matched = users.find(u => u.name === currentMyGeotabUser?.userName || u.id === currentMyGeotabUser?.userName);
-            if (matched && !demoUser) {
-              setDemoUser(matched);
-            }
-          }
-          // Load notifications for current user
-          if (demoUser && notificationEngine) {
-            notificationEngine.getNotificationsForUser(demoUser.id).then(ns => {
-              if (mounted) setNotifications(ns);
-            });
-            notificationEngine.getUnreadCount(demoUser.id).then(c => {
-              if (mounted) setUnreadCount(c);
-            });
-          }
-          setProviderError(null);
-        }
-      } catch (e) {
-        if (mounted) {
-          const msg = e instanceof Error ? e.message : "Failed to load data from MyGeotab.";
-          setMyGeotabError(msg);
-          // No silent fallback: if ADDIN_DATA was intended but failed, surface the error
-          if (mode === "ADDIN_DATA" && !geotabApi) {
-            setProviderError("MyGeotab Add-In API is not available. ADDIN_DATA mode requires running inside a registered MyGeotab Add-In.");
-          } else if (mode === "ADDIN_DATA" && !addInId) {
-            setProviderError("Add-In Id is not configured. Enter your AddInId to use ADDIN_DATA storage.");
-          } else {
-            setProviderError(msg);
-          }
-          // Fall back to DEMO only as a last resort for standalone preview
-          if (mode === "DEMO") {
-            const fb = bookingDataProvider;
-            Promise.all([
-              fb.getAssets(),
-              fb.getUsers(),
-              fb.getBookings(),
-            ]).then(([a, u, b]) => {
-              if (mounted) {
-                setAssets(a);
-                setUsers(u);
-                setBookings(b);
+    // Subscribe to future lifecycle updates
+    const unsubscribe = subscribeToLifecycle((bridgeState) => {
+      if (!mounted) return;
+      if (bridgeState.api && bridgeState.api !== geotabApiRef.current) {
+        setGeotabApi(bridgeState.api);
+        geotabApiRef.current = bridgeState.api;
+        // Only call getSession once per unique API object
+        if (lastGetSessionApiRef.current !== bridgeState.api) {
+          lastGetSessionApiRef.current = bridgeState.api;
+          try {
+            bridgeState.api.getSession?.((session) => {
+              if (mounted && session) {
+                setCurrentMyGeotabUser(session);
+                if (addInIdRef.current && modeRef.current === "DEMO") {
+                  setMode("ADDIN_DATA");
+                  modeRef.current = "ADDIN_DATA";
+                  setProviderError(null);
+                }
               }
             });
+          } catch (err) {
+            // getSession() threw synchronously; API object is still valid, just session retrieval failed
+            const msg = err instanceof Error ? err.message : "Failed to retrieve MyGeotab session.";
+            setMyGeotabError(msg);
           }
         }
       }
-    };
-
-    loadMasterData();
+    });
 
     return () => {
       mounted = false;
-      window.removeEventListener("opex-vbm:initialize", onInitialize as EventListener);
-      window.removeEventListener("opex-vbm:focus", onFocus as EventListener);
+      unsubscribe();
     };
-  }, [mode, geotabApi, addInId, demoUser, currentMyGeotabUser]);
+  }, []);
+
+  // ── Main data loading effect: re-runs when mode/geotabApi/addInId change ─
+  useEffect(() => {
+      let mounted = true;
+
+      // Determine effective provider: no silent fallback to DEMO when LIVE is intended
+      // ADDIN_DATA mode requires a valid MyGeotab API and AddInId; never fall back to DEMO
+      const effectiveMode = mode;
+      const provider: BookingDataProvider = effectiveMode === "ADDIN_DATA"
+        ? createAddInDataProvider(geotabApi, addInId)
+        : bookingDataProvider;
+
+      const loadMasterData = async () => {
+        try {
+          const [assets, users, bookings] = await Promise.all([
+            provider.getAssets(),
+            provider.getUsers(),
+            provider.getBookings(),
+          ]);
+          if (mounted) {
+            setAssets(assets);
+            setUsers(users);
+            setBookings(bookings);
+            if (effectiveMode === "ADDIN_DATA" && currentMyGeotabUser) {
+              const matched = users.find(u => u.name === currentMyGeotabUser?.userName || u.id === currentMyGeotabUser?.userName);
+              if (matched && !demoUser) {
+                setDemoUser(matched);
+              }
+            }
+            if (demoUser && notificationEngine) {
+              notificationEngine.getNotificationsForUser(demoUser.id).then(ns => {
+                if (mounted) setNotifications(ns);
+              });
+              notificationEngine.getUnreadCount(demoUser.id).then(c => {
+                if (mounted) setUnreadCount(c);
+              });
+            }
+            setProviderError(null);
+          }
+        } catch (e) {
+          if (mounted) {
+            const msg = e instanceof Error ? e.message : "Failed to load data from MyGeotab.";
+            setMyGeotabError(msg);
+            if (mode === "ADDIN_DATA" && !geotabApi) {
+              setProviderError("MyGeotab Add-In API is not available. ADDIN_DATA mode requires running inside a registered MyGeotab Add-In.");
+            } else if (mode === "ADDIN_DATA" && !addInId) {
+              setProviderError("Add-In Id is not configured. Enter your AddInId to use ADDIN_DATA storage.");
+            } else {
+              setProviderError(msg);
+            }
+            if (mode === "DEMO") {
+              const fb = bookingDataProvider;
+              Promise.all([
+                fb.getAssets(),
+                fb.getUsers(),
+                fb.getBookings(),
+              ]).then(([a, u, b]) => {
+                if (mounted) {
+                  setAssets(a);
+                  setUsers(u);
+                  setBookings(b);
+                }
+              });
+            }
+          }
+        }
+      };
+
+      loadMasterData();
+
+      return () => {
+        mounted = false;
+      };
+    }, [mode, geotabApi, addInId, demoUser, currentMyGeotabUser]);
 
   // Keep the AddInId text input in sync with the persisted value
   useEffect(() => {
@@ -1785,8 +1830,9 @@ export default function App() {
   }, [addInId]);
 
   const provider = useMemo(() => {
-    const effectiveMode = mode === "ADDIN_DATA" && !geotabApi ? "DEMO" : mode;
-    if (effectiveMode === "ADDIN_DATA") {
+    // ADDIN_DATA mode requires a valid MyGeotab API and AddInId;
+    // never fall back to DEMO/localStorage when LIVE is intended
+    if (mode === "ADDIN_DATA") {
       return createAddInDataProvider(geotabApi, addInId);
     }
     return bookingDataProvider;
