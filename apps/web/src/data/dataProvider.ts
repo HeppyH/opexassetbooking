@@ -1,4 +1,4 @@
-/*───────────────────── Local MyGeotab-Aligned Data Provider ─────────────────────*/
+﻿/*â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ Local MyGeotab-Aligned Data Provider â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€*/
 
 import type {
   MyGeotabDevice,
@@ -23,14 +23,18 @@ import {
   mockMyGeotabStatusData,
   mockMyGeotabLogRecords,
   mockOpexBookings,
-} from "./mockMyGeotab";
+} from "./mockMyGeotab.ts";
 
 const STORAGE_KEY = "opex-vbm-demo-bookings";
 const RESET_KEY = "opex-vbm-demo-reset";
 const NOTIFICATION_STORAGE_KEY = "opex-vbm-demo-notifications";
 const AUDIT_STORAGE_KEY = "opex-vbm-demo-audit";
 
-/*───────────────────── Helper: resolve master data references ─────────────────────*/
+function overlaps(aStart: Date, aEnd: Date, bStart: Date, bEnd: Date): boolean {
+  return aStart < bEnd && bStart < aEnd;
+}
+
+/*â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ Helper: resolve master data references â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€*/
 
 function resolveAsset(device: MyGeotabDevice): ResolvedAsset {
   return {
@@ -71,6 +75,7 @@ function resolveUser(user: MyGeotabUser): ResolvedUser {
     id: user.id,
     name: user.name || "Unknown",
     roles: user.role ? [user.role] : ["EMPLOYEE"],
+    companyGroups: user.companyGroups ?? [],
   };
 }
 
@@ -81,6 +86,7 @@ function resolveBooking(
 ): ResolvedBooking {
   const device = devices.get(booking.deviceId);
   const requester = users.get(booking.requesterUserId);
+  const driver = booking.assignedDriverUserId ? users.get(booking.assignedDriverUserId) : undefined;
 
   return {
     id: booking.id,
@@ -104,10 +110,12 @@ function resolveBooking(
     version: booking.version,
     created_at: booking.createdAt,
     updated_at: booking.updatedAt,
+    driver_id: booking.assignedDriverUserId ?? null,
+    driver_name: driver?.name ?? null,
   };
 }
 
-/*───────────────────── Local Data Provider Implementation ─────────────────────*/
+/*â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ Local Data Provider Implementation â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€*/
 export class LocalBookingDataProvider implements BookingDataProvider, NotificationDataProvider {
   private devices: MyGeotabDevice[];
   private users: MyGeotabUser[];
@@ -129,7 +137,7 @@ export class LocalBookingDataProvider implements BookingDataProvider, Notificati
     this.auditRecords = this.loadAuditRecordsFromStorage();
   }
 
-  /*───────────────────── localStorage persistence ─────────────────────*/
+  /*â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ localStorage persistence â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€*/
   private loadBookingsFromStorage(): OpexBooking[] {
     try {
       const raw = localStorage.getItem(STORAGE_KEY);
@@ -190,7 +198,7 @@ export class LocalBookingDataProvider implements BookingDataProvider, Notificati
     }
   }
 
-  /*───────────────────── Master data ─────────────────────*/
+  /*â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ Master data â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€*/
   async getAssets(): Promise<ResolvedAsset[]> {
     return this.devices.map(resolveAsset);
   }
@@ -211,7 +219,7 @@ export class LocalBookingDataProvider implements BookingDataProvider, Notificati
     return [...this.logRecords];
   }
 
-  /*───────────────────── Booking operations ─────────────────────*/
+  /*â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ Booking operations â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€*/
   async getBookings(): Promise<ResolvedBooking[]> {
     const deviceMap = new Map(this.devices.map(d => [d.id, d]));
     const userMap = new Map(this.users.map(u => [u.id, u]));
@@ -227,6 +235,8 @@ export class LocalBookingDataProvider implements BookingDataProvider, Notificati
     purpose: string;
     destination: string | null;
     passengerCount: number | null;
+    driverId?: string | null;
+    driverName?: string | null;
   }): Promise<ResolvedBooking> {
     const newId = `b${Date.now()}`;
     const now = new Date().toISOString();
@@ -244,7 +254,7 @@ export class LocalBookingDataProvider implements BookingDataProvider, Notificati
       destination: input.destination,
       passengerCount: input.passengerCount,
       status: "PENDING_APPROVAL",
-      assignedDriverUserId: null,
+      assignedDriverUserId: input.driverId ?? null,
       approverId: null,
       approvalRemarks: null,
       createdAt: now,
@@ -290,7 +300,7 @@ export class LocalBookingDataProvider implements BookingDataProvider, Notificati
     this.saveAuditRecordsToStorage();
   }
 
-  /*───────────────────── Notification operations ─────────────────────*/
+  /*â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ Notification operations â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€*/
   async getNotifications(userId: string, opts?: { limit?: number; offset?: number; unreadOnly?: boolean; type?: NotificationType }): Promise<OpexNotification[]> {
     let result = this.notifications
       .filter(n => n.recipient_user_id === userId)
@@ -374,7 +384,7 @@ export class LocalBookingDataProvider implements BookingDataProvider, Notificati
     this.saveNotificationsToStorage();
   }
 
-  /*───────────────────── Audit operations ─────────────────────*/
+  /*â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ Audit operations â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€*/
   async createAuditRecord(input: {
     booking_id: string;
     action: string;
@@ -415,5 +425,5 @@ export class LocalBookingDataProvider implements BookingDataProvider, Notificati
   }
 }
 
-/*───────────────────── Singleton instance ─────────────────────*/
+/*â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ Singleton instance â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€*/
 export const bookingDataProvider = new LocalBookingDataProvider();

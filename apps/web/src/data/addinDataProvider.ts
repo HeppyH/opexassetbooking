@@ -1,6 +1,6 @@
 /*───────────────────── MyGeotab AddInData Booking Provider ─────────────────────*/
 /* Booking transactions stored in MyGeotab AddInData.
-   One AddInData record per booking. details = JSON string (max 10,000 chars).
+   One AddInData record per booking. details = JSON-compatible object (max 10,000 serialized chars).
    Master data (devices/users/groups) loaded live from MyGeotab Get calls.
    No localStorage, no external database, no PostgreSQL/Neon/Cloudflare. */
 
@@ -18,7 +18,7 @@ import type {
   OpexBookingAudit,
   NotificationType,
 } from "./types";
-import { isValidAddInId } from "../config/addinId";
+import { isValidAddInId } from "../config/addinId.ts";
 
 /*───────────────────── Geotab API type (Add-In context) ─────────────────────*/
 
@@ -29,6 +29,8 @@ type GeotabApi = {
 
 const MAX_DETAILS_CHARS = 10000;
 const DEFAULT_GROUP_ID = "GroupCompanyId";
+
+type AddInDataDetails = string | Record<string, unknown>;
 
 /*───────────────────── Diagnostic Logging ─────────────────────*/
 /* Safe diagnostic logging for MyGeotab API lifecycle.
@@ -46,25 +48,30 @@ function diagLog(message: string, detail?: unknown): void {
 const NOTIFICATION_GROUP_ID = DEFAULT_GROUP_ID;
 const AUDIT_GROUP_ID = DEFAULT_GROUP_ID;
 
-function serializeNotification(n: OpexNotification): string {
-  const json = JSON.stringify(n);
+function assertDetailsWithinLimit(value: unknown): void {
+  const json = JSON.stringify(value);
   if (json.length > MAX_DETAILS_CHARS) {
     throw new Error(`ADDIN_DATA_DETAILS_EXCEEDED: ${json.length} characters (max ${MAX_DETAILS_CHARS})`);
   }
-  return json;
 }
-function deserializeNotification(details: string): OpexNotification {
-  return JSON.parse(details) as OpexNotification;
+
+function toDetailsObject<T extends object>(details: AddInDataDetails): T {
+  return (typeof details === "string" ? JSON.parse(details) : details) as T;
 }
-function serializeAudit(a: OpexBookingAudit): string {
-  const json = JSON.stringify(a);
-  if (json.length > MAX_DETAILS_CHARS) {
-    throw new Error(`ADDIN_DATA_DETAILS_EXCEEDED: ${json.length} characters (max ${MAX_DETAILS_CHARS})`);
-  }
-  return json;
+
+function serializeNotification(n: OpexNotification): OpexNotification {
+  assertDetailsWithinLimit(n);
+  return n;
 }
-function deserializeAudit(details: string): OpexBookingAudit {
-  return JSON.parse(details) as OpexBookingAudit;
+function deserializeNotification(details: AddInDataDetails): OpexNotification {
+  return toDetailsObject<OpexNotification>(details);
+}
+function serializeAudit(a: OpexBookingAudit): OpexBookingAudit {
+  assertDetailsWithinLimit(a);
+  return a;
+}
+function deserializeAudit(details: AddInDataDetails): OpexBookingAudit {
+  return toDetailsObject<OpexBookingAudit>(details);
 }
 
 /*───────────────────── Raw MyGeotab record shapes ─────────────────────*/
@@ -101,7 +108,7 @@ type RawMyGeotabGroup = {
 type AddInDataRecord = {
   id: string;
   addInId: string;
-  details: string;
+  details: AddInDataDetails;
   groups?: Array<{ id: string }>;
   dateTime?: string;
 };
@@ -165,6 +172,7 @@ function mapLiveUser(raw: RawMyGeotabUser): ResolvedUser {
     id: raw.id,
     name: raw.name || "Unknown",
     roles: raw.role ? [raw.role] : ["EMPLOYEE"],
+    companyGroups: raw.companyGroups ?? [],
   };
 }
 
@@ -178,16 +186,13 @@ function mapLiveGroup(raw: RawMyGeotabGroup): MyGeotabGroup {
 
 /*───────────────────── Booking serialization (10,000-char limit) ─────────────────────*/
 
-function serializeBooking(booking: OpexBooking): string {
-  const json = JSON.stringify(booking);
-  if (json.length > MAX_DETAILS_CHARS) {
-    throw new Error(`ADDIN_DATA_DETAILS_EXCEEDED: ${json.length} characters (max ${MAX_DETAILS_CHARS})`);
-  }
-  return json;
+function serializeBooking(booking: OpexBooking): OpexBooking {
+  assertDetailsWithinLimit(booking);
+  return booking;
 }
 
-function deserializeBooking(details: string): OpexBooking {
-  return JSON.parse(details) as OpexBooking;
+function deserializeBooking(details: AddInDataDetails): OpexBooking {
+  return toDetailsObject<OpexBooking>(details);
 }
 
 /*───────────────────── Conflict check helper ─────────────────────*/
@@ -309,6 +314,8 @@ export class AddInDataBookingDataProvider implements BookingDataProvider, Notifi
     purpose: string;
     destination: string | null;
     passengerCount: number | null;
+    driverId?: string | null;
+    driverName?: string | null;
   }): Promise<ResolvedBooking> {
     // Best-effort conflict check: load all bookings, filter overlaps for same asset
     const existing = await this.getBookings();
@@ -338,7 +345,7 @@ export class AddInDataBookingDataProvider implements BookingDataProvider, Notifi
       destination: input.destination,
       passengerCount: input.passengerCount,
       status: "PENDING_APPROVAL",
-      assignedDriverUserId: null,
+      assignedDriverUserId: input.driverId ?? null,
       approverId: null,
       approvalRemarks: null,
       createdAt: now,
@@ -621,7 +628,16 @@ export class AddInDataBookingDataProvider implements BookingDataProvider, Notifi
   }
 }
 
-/*───────────────────── Helper: build provider from Add-In API context ─────────────────────*/
+export {
+  serializeBooking,
+  deserializeBooking,
+  serializeNotification,
+  deserializeNotification,
+  serializeAudit,
+  deserializeAudit,
+  assertDetailsWithinLimit,
+};
+
 
 export function createAddInDataProvider(api: GeotabApi | null, addInId: string | null): AddInDataBookingDataProvider {
   return new AddInDataBookingDataProvider(api, addInId);
@@ -637,6 +653,7 @@ function resolveAddInDataBooking(
   const booking = deserializeBooking(record.details);
   const device = devices.get(booking.deviceId);
   const requester = users.get(booking.requesterUserId);
+  const driver = booking.assignedDriverUserId ? users.get(booking.assignedDriverUserId) : undefined;
   return {
     id: booking.id,
     requester_id: booking.requesterUserId,
@@ -659,6 +676,8 @@ function resolveAddInDataBooking(
     version: booking.version,
     created_at: booking.createdAt,
     updated_at: booking.updatedAt,
+    driver_id: booking.assignedDriverUserId ?? null,
+    driver_name: driver?.name ?? null,
   };
 }
 
@@ -685,5 +704,7 @@ function resolveBookingToResolved(booking: OpexBooking): ResolvedBooking {
     version: booking.version,
     created_at: booking.createdAt,
     updated_at: booking.updatedAt,
+    driver_id: booking.assignedDriverUserId ?? null,
+    driver_name: null,
   };
 }
