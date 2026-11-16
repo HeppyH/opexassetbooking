@@ -47,6 +47,7 @@ type OpexNotification = {
 /*───────────────────── Constants ─────────────────────*/
 
 const ADDIN_ID_KEY = "opex-vbm-addin-id";
+const DEFAULT_ADDIN_ID = "aDJjMmVmZWMtYzU1OC00MTJ";
 const NOTIFICATION_GROUP_ID = "GroupCompanyId";
 const POLL_INTERVAL_MS = 30000; // 30 seconds
 const MAX_NOTIFICATIONS_PER_POLL = 10;
@@ -81,9 +82,9 @@ async function getAddInId(service: ServiceAddIn): Promise<string | null> {
     const localStorage = service.localStorage;
     if (!localStorage || typeof localStorage.get !== "function") return null;
     const addInId = await localStorage.get(ADDIN_ID_KEY);
-    return addInId ?? null;
+    return addInId ?? DEFAULT_ADDIN_ID;
   } catch {
-    return null;
+    return DEFAULT_ADDIN_ID;
   }
 }
 
@@ -124,11 +125,37 @@ class NotificationRateLimiter {
 
 const rateLimiter = new NotificationRateLimiter();
 
+/*───────────────────── Diagnostic Logging ─────────────────────*/
+function diagLog(message: string, detail?: unknown): void {
+  try {
+    if (typeof console !== "undefined" && console.log) {
+      const detailStr = detail !== undefined ? ` | detail=${String(detail).slice(0, 100)}` : "";
+      console.log(`[OPEX-VBM-ServiceAddIn] ${message}${detailStr}`);
+    }
+  } catch {
+    // Logging must never throw
+  }
+}
+
+/* Local AddInId validation for standalone Service Add-In bundle.
+   Mirrors config/addinId.ts isValidAddInId but self-contained for WebWorker context. */
+function isValidAddInIdLocal(value: string | null): boolean {
+  if (!value || typeof value !== "string") return false;
+  if (value.length !== 23) return false;
+  if (!value.startsWith("a")) return false;
+  return /^a[A-Za-z0-9_-]{22}$/.test(value);
+}
+
 /*───────────────────── Notification Delivery ─────────────────────*/
 
 async function deliverPendingNotifications(service: ServiceAddIn): Promise<void> {
+  diagLog("Service Add-In deliverPendingNotifications started");
   const addInId = await getAddInId(service);
-  if (!addInId) return;
+  if (!addInId) {
+    diagLog("Service Add-In deliverPendingNotifications: no AddInId, safe no-op");
+    return;
+  }
+  diagLog("Service Add-In AddInId resolved", { addInIdValid: isValidAddInIdLocal(addInId) });
 
   // Retrieve pending notifications from AddInData
   const records = await apiCall<{ addInId?: string; details?: string; id?: string }[]>(
@@ -144,7 +171,12 @@ async function deliverPendingNotifications(service: ServiceAddIn): Promise<void>
     }
   );
 
-  if (!records || records.length === 0) return;
+  if (!records || records.length === 0) {
+    diagLog("Service Add-In deliverPendingNotifications: no pending records");
+    return;
+  }
+
+  diagLog("Service Add-In deliverPendingNotifications: pending records found", { count: records.length });
 
   for (const record of records) {
     // Re-check delivery status before processing (idempotency guard)
@@ -228,6 +260,7 @@ if (typeof self !== "undefined") {
   selfGlobal.geotab.addin = selfGlobal.geotab.addin ?? {};
 
   selfGlobal.geotab.addin.service = (service: ServiceAddIn) => {
+    diagLog("Service Add-In registered, initializing notification delivery");
     // Deliver pending notifications on startup
     deliverPendingNotifications(service).catch(() => {
       // Swallow errors – Service Add-In must not crash
@@ -242,6 +275,7 @@ if (typeof self !== "undefined") {
 
     // Keep the service alive (WebWorker context)
     return () => {
+      diagLog("Service Add-In cleanup, stopping notification polling");
       clearInterval(interval);
     };
   };

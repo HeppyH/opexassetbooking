@@ -4,6 +4,7 @@ import type { ResolvedAsset, ResolvedBooking, ResolvedUser, BookingDataProvider,
 import { createAddInDataProvider, AddInDataBookingDataProvider } from "../data/addinDataProvider";
 import { createNotificationEngine, NotificationEngine } from "../data/notificationService";
 import { useAutoRefresh } from "./autoRefresh";
+import { DEFAULT_ADDIN_ID, ADDIN_ID_STORAGE_KEY, resolveAddInId, isValidAddInId } from "../config/addinId";
 
 const TENANT = import.meta.env.VITE_GEOTAB_DATABASE || "opex_trial";
 
@@ -1636,12 +1637,13 @@ export default function App() {
   const [rejectReason, setRejectReasonState] = useState<{ [id: string]: string }>({});
   const [addInId, setAddInId] = useState<string | null>(() => {
     try {
-      return localStorage.getItem("opex-vbm-addin-id") || null;
+      return resolveAddInId(localStorage.getItem(ADDIN_ID_STORAGE_KEY) || null);
     } catch {
-      return null;
+      return DEFAULT_ADDIN_ID;
     }
   });
   const [addInIdInput, setAddInIdInput] = useState<string>("");
+  const addInIdValid = isValidAddInId(addInId);
   const [currentMyGeotabUser, setCurrentMyGeotabUser] = useState<{ userName?: string; database?: string; server?: string } | null>(null);
   const [providerError, setProviderError] = useState<string | null>(null);
   const [notifications, setNotifications] = useState<OpexNotification[]>([]);
@@ -1876,14 +1878,14 @@ export default function App() {
     const trimmed = addInIdInput.trim();
     if (!trimmed) {
       setAddInId(null);
-      try { localStorage.removeItem("opex-vbm-addin-id"); } catch { }
+      try { localStorage.removeItem(ADDIN_ID_STORAGE_KEY); } catch { }
       setProviderError(null);
       setMode("DEMO");
       setMessage({ type: "success", text: "Add-In Id cleared. Running in DEMO mode." });
       return;
     }
     try {
-      localStorage.setItem("opex-vbm-addin-id", trimmed);
+      localStorage.setItem(ADDIN_ID_STORAGE_KEY, trimmed);
       setAddInId(trimmed);
       setProviderError(null);
       // When inside MyGeotab, switch to LIVE (ADDIN_DATA); otherwise stay DEMO until API is available
@@ -2247,7 +2249,7 @@ export default function App() {
                 style={{ width: "180px", fontSize: "var(--text-sm)" }}
                 value={addInIdInput}
                 onChange={e => setAddInIdInput(e.target.value)}
-                placeholder="e.g. opex-vbm-addin"
+                placeholder="e.g. 0sLv7MVYQSy5TwusJHpGQA"
                 disabled={mode === "DEMO" && !geotabApi}
               />
               <button
@@ -2258,9 +2260,11 @@ export default function App() {
               >
                 Save
               </button>
-              {addInId && (
+              {addInId && addInIdValid ? (
                 <span style={{ fontSize: "var(--text-xs)", color: "#10B981" }}>● configured</span>
-              )}
+              ) : addInId && !addInIdValid ? (
+                <span style={{ fontSize: "var(--text-xs)", color: "#EF4444" }}>⚠ invalid format</span>
+              ) : null}
             </div>
 
             {/* Current MyGeotab user from authenticated session */}

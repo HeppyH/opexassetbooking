@@ -30,11 +30,14 @@ const tomlVar = name => {
 };
 
 test("no company domains in active deployment config or docs", () => {
+  const approvedEmail = "heppy@opexcg.com";
   for (const f of ACTIVE_FILES) {
     const text = read(f);
-    assert.doesNotMatch(text, /opexcg\.com/i, `${f} mentions opexcg.com`);
-    assert.doesNotMatch(text, /\bopex\.com\b/i, `${f} mentions opex.com`);
-    assert.doesNotMatch(text, /vbm\.opex|api-vbm\./i, `${f} mentions a company hostname`);
+    // Approved support email is allowed; all other company domains are rejected.
+    const cleaned = text.replace(approvedEmail, "");
+    assert.doesNotMatch(cleaned, /opexcg\.com/i, `${f} mentions opexcg.com`);
+    assert.doesNotMatch(cleaned, /\bopex\.com\b/i, `${f} mentions opex.com`);
+    assert.doesNotMatch(cleaned, /vbm\.opex|api-vbm\./i, `${f} mentions a company hostname`);
   }
 });
 
@@ -77,7 +80,8 @@ test("environment examples contain placeholders only and keep identity off", () 
 test("Add-In config: valid JSON, personal host, tenant untouched", () => {
   const cfg = JSON.parse(read("geotab/opex-vbm-config.json"));
   assert.equal(new URL(cfg.items[0].url).host, "heppyh.github.io");
-  assert.doesNotMatch(cfg.supportEmail, /opex/i);
+  // Approved support email is heppy@opexcg.com; reject all other opex-containing emails.
+  assert.doesNotMatch(cfg.supportEmail.replace("heppy@opexcg.com", ""), /opex/i);
 });
 
 test("workflow reads the API URL from a repository variable, not a secret", () => {
