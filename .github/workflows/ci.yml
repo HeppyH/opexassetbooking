@@ -31,6 +31,9 @@ jobs:
       - name: Application tests
         run: npm test
 
+      - name: Web regression tests
+        run: npm --workspace apps/web run test
+
       - name: Service Add-In tests
         run: node --experimental-strip-types apps/web/test/service-addin.test.mjs
 

@@ -24,6 +24,7 @@ import {
   mockMyGeotabLogRecords,
   mockOpexBookings,
 } from "./mockMyGeotab.ts";
+import { validateResolvedBooking } from "./bookingValidation.ts";
 
 const STORAGE_KEY = "opex-vbm-demo-bookings";
 const RESET_KEY = "opex-vbm-demo-reset";
@@ -87,6 +88,13 @@ function resolveBooking(
   const device = devices.get(booking.deviceId);
   const requester = users.get(booking.requesterUserId);
   const driver = booking.assignedDriverUserId ? users.get(booking.assignedDriverUserId) : undefined;
+  const validation = validateResolvedBooking({
+    asset_id: booking.deviceId ?? null,
+    requester_id: booking.requesterUserId,
+    status: booking.status ?? "",
+    start_at: booking.startAt,
+    end_at: booking.endAt,
+  });
 
   return {
     id: booking.id,
@@ -112,6 +120,7 @@ function resolveBooking(
     updated_at: booking.updatedAt,
     driver_id: booking.assignedDriverUserId ?? null,
     driver_name: driver?.name ?? null,
+    dataQuality: validation.quality,
   };
 }
 
