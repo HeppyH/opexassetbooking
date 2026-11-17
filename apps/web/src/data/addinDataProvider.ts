@@ -19,6 +19,7 @@ import type {
   NotificationType,
 } from "./types";
 import { isValidAddInId } from "../config/addinId.ts";
+import { validateResolvedBooking } from "./bookingValidation.ts";
 
 /*───────────────────── Geotab API type (Add-In context) ─────────────────────*/
 
@@ -672,38 +673,77 @@ function resolveAddInDataBooking(
   devices: Map<string, RawMyGeotabDevice>,
   users: Map<string, RawMyGeotabUser>,
 ): ResolvedBooking {
-  const booking = deserializeBooking(record.details);
-  const device = devices.get(booking.deviceId);
-  const requester = users.get(booking.requesterUserId);
+  let booking: OpexBooking;
+  try {
+    booking = deserializeBooking(record.details);
+  } catch {
+    booking = {
+      id: record.id,
+      deviceId: "",
+      requesterUserId: "",
+      requestedClass: "PASSENGER",
+      startAt: "",
+      endAt: "",
+      bufferBeforeMinutes: 0,
+      bufferAfterMinutes: 0,
+      purpose: "",
+      destination: null,
+      passengerCount: null,
+      status: "PENDING_APPROVAL",
+      assignedDriverUserId: null,
+      approverId: null,
+      approvalRemarks: null,
+      createdAt: "",
+      updatedAt: "",
+      version: 0,
+    };
+  }
+  const device = devices.get(booking.deviceId ?? undefined);
+  const requester = users.get(booking.requesterUserId ?? undefined);
   const driver = booking.assignedDriverUserId ? users.get(booking.assignedDriverUserId) : undefined;
+  const validation = validateResolvedBooking({
+    asset_id: booking.deviceId ?? null,
+    requester_id: booking.requesterUserId ?? "",
+    status: booking.status ?? "",
+    start_at: booking.startAt ?? "",
+    end_at: booking.endAt ?? "",
+  });
   return {
-    id: booking.id,
-    requester_id: booking.requesterUserId,
+    id: booking.id ?? record.id,
+    requester_id: booking.requesterUserId ?? "",
     requester_name: requester?.name ?? "Unknown User",
     requested_class: booking.requestedClass,
     asset_id: booking.deviceId ?? null,
     asset_code: device ? `VEH-${device.id.slice(-3).toUpperCase()}` : null,
     asset_name: device ? parseVehicleName(device.name ?? "") : null,
     registration_no: device?.licensePlate ?? null,
-    start_at: booking.startAt,
-    end_at: booking.endAt,
+    start_at: booking.startAt ?? "",
+    end_at: booking.endAt ?? "",
     buffer_before_minutes: booking.bufferBeforeMinutes,
     buffer_after_minutes: booking.bufferAfterMinutes,
     purpose: booking.purpose,
     destination: booking.destination,
     passenger_count: booking.passengerCount,
-    status: booking.status,
+    status: booking.status ?? "",
     approver_id: booking.approverId ?? null,
     approval_remarks: booking.approvalRemarks ?? null,
     version: booking.version,
-    created_at: booking.createdAt,
-    updated_at: booking.updatedAt,
+    created_at: booking.createdAt ?? "",
+    updated_at: booking.updatedAt ?? "",
     driver_id: booking.assignedDriverUserId ?? null,
     driver_name: driver?.name ?? null,
+    dataQuality: validation.quality,
   };
 }
 
 function resolveBookingToResolved(booking: OpexBooking): ResolvedBooking {
+  const validation = validateResolvedBooking({
+    asset_id: booking.deviceId ?? null,
+    requester_id: booking.requesterUserId,
+    status: booking.status ?? "",
+    start_at: booking.startAt,
+    end_at: booking.endAt,
+  });
   return {
     id: booking.id,
     requester_id: booking.requesterUserId,
@@ -728,5 +768,6 @@ function resolveBookingToResolved(booking: OpexBooking): ResolvedBooking {
     updated_at: booking.updatedAt,
     driver_id: booking.assignedDriverUserId ?? null,
     driver_name: null,
+    dataQuality: validation.quality,
   };
 }

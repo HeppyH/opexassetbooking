@@ -18,6 +18,9 @@ import {
 import { canRunDemoOnlyOperation, assertDemoOnlyOperation, assertProviderNotLiveForDemoOperation, getStateResetOnModeSwitch, isKnownMode } from "../safety/modeGuards";
 import { emitAuditEvent, snapshotBooking, type AuditAction } from "../audit/auditTrail";
 import { getTenantTimezone, toTenantLocalParts, toIsoFromTenantParts, formatTenantDateTime } from "../config/tenantTimezone";
+import { sortByDateTimeAccessor } from "./sortingHelpers";
+import { validateResolvedBooking, type BookingDataQuality } from "../data/bookingValidation";
+import { ErrorBoundary } from "./errorBoundary";
 
 const TENANT = import.meta.env.VITE_GEOTAB_DATABASE || "opex_trial";
 
@@ -71,6 +74,7 @@ type Booking = {
   driver_name: string | null;
   approver_id: string | null;
   approval_remarks: string | null;
+  dataQuality: BookingDataQuality;
 };
 
 type Toast = {
@@ -546,7 +550,7 @@ function Dashboard({
     addToast("success", "Data refreshed.");
   };
 
-  const recent = [...bookings].sort((a, b) => b.created_at.localeCompare(a.created_at)).slice(0, 5);
+  const recent = sortByDateTimeAccessor(bookings, b => b.created_at).slice(0, 5);
 
   return (
     <div className="page">
@@ -1379,13 +1383,25 @@ function BookingReports({
   onResetFilters: () => void;
   users: ResolvedUser[];
 }) {
-  const total = bookings.length;
-  const byStatus = bookings.reduce<Record<string, number>>((acc, b) => { acc[b.status] = (acc[b.status] || 0) + 1; return acc; }, {});
-  const byAsset = bookings.reduce<Record<string, number>>((acc, b) => { if (b.asset_code) acc[b.asset_code] = (acc[b.asset_code] || 0) + 1; return acc; }, {});
+  const validationResults = bookings.map(b => validateResolvedBooking(b));
+  const validBookings = bookings.filter((_, i) => validationResults[i].quality === "VALID");
+  const invalidBookings = bookings.filter((_, i) => validationResults[i].quality !== "VALID");
+
+  const total = validBookings.length;
+  const invalidTotal = invalidBookings.length;
+
+  const byStatus = validBookings.reduce<Record<string, number>>((acc, b) => { acc[b.status] = (acc[b.status] || 0) + 1; return acc; }, {});
+  const byAsset = validBookings.reduce<Record<string, number>>((acc, b) => { if (b.asset_code) acc[b.asset_code] = (acc[b.asset_code] || 0) + 1; return acc; }, {});
   const mostBooked = Object.entries(byAsset).sort((a, b) => b[1] - a[1]).slice(0, 5);
 
-  const assetsWithBookings = new Set(bookings.filter(b => b.asset_id).map(b => b.asset_id)).size;
+  const assetsWithBookings = new Set(validBookings.filter(b => b.asset_id).map(b => b.asset_id)).size;
   const utilization = assets.length > 0 ? Math.round((assetsWithBookings / assets.length) * 100) : 0;
+
+  const dataQualityByIssue = invalidBookings.reduce<Record<string, number>>((acc, b) => {
+    const result = validationResults[bookings.indexOf(b)];
+    result.issues.forEach((issue: string) => { acc[issue] = (acc[issue] || 0) + 1; });
+    return acc;
+  }, {});
 
   return (
     <div className="page">
@@ -1405,7 +1421,10 @@ function BookingReports({
       />
 
       <section className="stats">
-        <StatCard label="Total Bookings" value={total} sub="All time" />
+        <StatCard label="Total Bookings" value={total} sub="Valid bookings" />
+        {invalidTotal > 0 && (
+          <StatCard label="Data Quality Issues" value={invalidTotal} sub="Invalid records" />
+        )}
         <StatCard label="Asset Utilization" value={`${utilization}%`} sub={`${assetsWithBookings} of ${assets.length} assets used`} />
         <StatCard label="Most Booked Asset" value={mostBooked[0]?.[0] || "—"} sub={mostBooked[0]?.[1] ? `${mostBooked[0][1]} bookings` : "No data"} />
         <StatCard label="Status Summary" value={Object.keys(byStatus).length} sub="Different statuses" />
@@ -1431,7 +1450,7 @@ function BookingReports({
             <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(200px, 1fr))", gap: 14 }}>
               {Object.entries(byStatus).map(([status, count]) => (
                 <div key={status} className="stat-card">
-                  <div className="stat-label">{status.replace(/_/g, " ")}</div>
+                  <div className="stat-label">{formatStatusLabel(status)}</div>
                   <div className="stat-value">{count}</div>
                   <div className="stat-sub">bookings</div>
                 </div>
@@ -1440,6 +1459,28 @@ function BookingReports({
           )}
         </div>
       </section>
+
+      {invalidTotal > 0 && (
+        <section className="panel">
+          <div className="panel-head">
+            <div className="panel-head-content">
+              <h2>Data Quality Issues</h2>
+              <p>Bookings with missing or invalid data that are excluded from operational metrics.</p>
+            </div>
+          </div>
+          <div className="panel-body">
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(200px, 1fr))", gap: 14 }}>
+              {Object.entries(dataQualityByIssue).map(([issue, count]) => (
+                <div key={issue} className="stat-card" style={{ borderLeft: "4px solid #DC2626" }}>
+                  <div className="stat-label">{issue.replace(/_/g, " ")}</div>
+                  <div className="stat-value">{count}</div>
+                  <div className="stat-sub">records</div>
+                </div>
+              ))}
+            </div>
+          </div>
+        </section>
+      )}
 
       <section className="panel">
         <div className="panel-head">
@@ -2469,20 +2510,22 @@ export default function App() {
   const Page = (() => {
     switch (active) {
       case "Dashboard": return (
-        <Dashboard
-          bookings={dashboardBookings}
-          assets={assets}
-          loading={loading}
-          onLoadData={onLoadData}
-          onExport={onExportDashboard}
-          onNewBooking={() => navigateTo("New Booking")}
-          addToast={pushToastCb}
-          filters={filters}
-          onFilterChange={onFilterChange}
-          onApplyFilters={onLoadData}
-          onResetFilters={onResetFilters}
-          users={users}
-        />
+        <ErrorBoundary fallbackTitle="Dashboard Temporarily Unavailable" fallbackMessage="The dashboard section encountered an error.">
+          <Dashboard
+            bookings={dashboardBookings}
+            assets={assets}
+            loading={loading}
+            onLoadData={onLoadData}
+            onExport={onExportDashboard}
+            onNewBooking={() => navigateTo("New Booking")}
+            addToast={pushToastCb}
+            filters={filters}
+            onFilterChange={onFilterChange}
+            onApplyFilters={onLoadData}
+            onResetFilters={onResetFilters}
+            users={users}
+          />
+        </ErrorBoundary>
       );
       case "New Booking": return (
         <NewBooking
@@ -2572,20 +2615,24 @@ export default function App() {
         />
       );
       case "Asset Availability": return (
-        <AssetAvailability assets={assets} bookings={availabilityBookings} onExport={onExportFleet}
-          filters={filters}
-          onFilterChange={onFilterChange}
-          onApplyFilters={onLoadData}
-          onResetFilters={onResetFilters}
-          users={users} />
+        <ErrorBoundary fallbackTitle="Asset Availability Temporarily Unavailable" fallbackMessage="The asset availability section encountered an error.">
+          <AssetAvailability assets={assets} bookings={availabilityBookings} onExport={onExportFleet}
+            filters={filters}
+            onFilterChange={onFilterChange}
+            onApplyFilters={onLoadData}
+            onResetFilters={onResetFilters}
+            users={users} />
+        </ErrorBoundary>
       );
       case "Booking Reports": return (
-        <BookingReports bookings={reportsBookings} assets={assets} onExport={onExportDashboard}
-          filters={filters}
-          onFilterChange={onFilterChange}
-          onApplyFilters={onLoadData}
-          onResetFilters={onResetFilters}
-          users={users} />
+        <ErrorBoundary fallbackTitle="Booking Reports Temporarily Unavailable" fallbackMessage="The booking reports section encountered an error.">
+          <BookingReports bookings={reportsBookings} assets={assets} onExport={onExportDashboard}
+            filters={filters}
+            onFilterChange={onFilterChange}
+            onApplyFilters={onLoadData}
+            onResetFilters={onResetFilters}
+            users={users} />
+        </ErrorBoundary>
       );
       default: return (
         <Dashboard

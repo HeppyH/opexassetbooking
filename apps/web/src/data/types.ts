@@ -44,6 +44,22 @@ export interface MyGeotabLogRecord extends GeotabLocation {
   heading?: number;
 }
 
+/*───────────────────── OPEX Booking data quality ─────────────────────*/
+
+export type BookingDataQuality =
+  | "VALID"
+  | "MISSING_ASSET"
+  | "MISSING_REQUESTER"
+  | "MISSING_STATUS"
+  | "INVALID_DATETIME"
+  | "MALFORMED_DETAILS"
+  | "MULTIPLE_VALIDATION_ERRORS";
+
+export interface BookingValidationResult {
+  quality: BookingDataQuality;
+  issues: string[];
+}
+
 /*───────────────────── OPEX Booking (MyGeotab-aligned) ─────────────────────*/
 export interface OpexBooking {
   id: string;
@@ -114,8 +130,9 @@ export interface ResolvedBooking {
   version: number;
   created_at: string;
   updated_at: string;
-  driver_id: string | null;
-  driver_name: string | null;
+    driver_id: string | null;
+    driver_name: string | null;
+    dataQuality: BookingDataQuality;
 }
 
 export interface ResolvedUser {
